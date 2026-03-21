@@ -24,6 +24,7 @@ from ..Car.Car import CarList
 from ..camera_locator.anchor import Anchor
 from ..camera_locator.point_picker import PointsPicker
 from ..filters.kalman_filter import KalmanFilterWrapper
+from .hungarian_tracker import HungarianTracker  # tunning: 新增匈牙利关联模块导入
 
 import cv2
 import numpy as np
@@ -208,6 +209,16 @@ class CameraDetector(Node):
 
         self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         self.infer_thread.start()
+
+        # tunning: 新增匈牙利 tracker，用于检测-轨迹关联，max_miss 配置可通过 detector config 调整
+        track_params = self.det_cfg.get('track', {})
+        self.hungarian = HungarianTracker(
+            iou_thr=float(track_params.get('iou_thr', 0.05)),
+            dist_thr=float(track_params.get('dist_thr', 200)),
+            max_miss=int(track_params.get('max_miss', 3))
+        )
+        # tunning: 当无检测时是否发布短期预测/历史位置信息（YAML 可配置）
+        self.publish_predict_when_no_det = bool(self.det_cfg.get('publish_predict_when_no_det', True))
 
         self.get_logger().info("CameraDetector 初始化完成。")
 
@@ -736,6 +747,55 @@ class CameraDetector(Node):
                 carList_results = []
 
                 if results is not None:
+                    """tunning:增加匈牙利匹配，保留投票机制，仅同一帧检测关联成稳定 track，
+                    然后把这些关联后的结果作为输入继续走原先的投票/车号判定/发布逻辑"""
+                    # tunning: 先用匈牙利做检测-轨迹关联，得到稳定 tracks
+                    tracks = self.hungarian.update(
+                        results,
+                        to_field_fn=lambda cx, cy: self.pixel_to_field(
+                            cx * ORIG_W / INFER_W, cy * ORIG_H / INFER_H)
+                    )
+
+                    # tunning: 将 tracks 转成“伪检测”供原投票/车号判定逻辑复用
+                    matched_results = []
+                    for tr in tracks:
+                        if tr.bbox is None:
+                            continue
+                        x1, y1, x2, y2 = tr.bbox
+                        w = x2 - x1
+                        h = y2 - y1
+                        cx = x1 + w / 2.0
+                        cy = y1 + h / 2.0
+                        xyxy = [float(x1), float(y1), float(x2), float(y2)]
+                        xywh = [float(cx), float(cy), float(w), float(h)]
+                        # 字段顺序与原 results 保持一致：xyxy, xywh, track_id, label, conf
+                        matched_results.append([xyxy, xywh, tr.id, tr.label])
+
+                    # tunning: 让后续投票/发布仍使用 matched_results（原有投票机制保留）
+                    results = matched_results
+
+                else:
+                    # tunning: 无检测时的策略仅保留预测发布，可选开关
+                    if self.publish_predict_when_no_det:
+                        for tr in self.hungarian.get_active_tracks():
+                            if tr.miss_cnt > self.hungarian.max_miss:
+                                continue
+                            if tr.last_field is None:
+                                continue
+                            field_x, field_y = tr.last_field
+                            field_x = max(0.0, min(28.0, field_x))
+                            field_y = max(0.0, min(15.0, field_y))
+                            car_id = 9000 + (tr.id if isinstance(tr.id, int) else 0)
+                            loc = Location()
+                            loc.x = float(field_x)
+                            loc.y = float(field_y)
+                            loc.z = 0.0
+                            loc.id = int(car_id)
+                            loc.label = "Red" if loc.id < 100 else "Blue"
+                            allLocation.locs.append(loc)
+
+                # 其余投票、车号映射、KF 平滑、CarList 更新与 publish 的代码保持原有逻辑
+                if results is not None:
                     for result in results:
                         xyxy_box, xywh_box, track_id, label = result
 
@@ -780,7 +840,7 @@ class CameraDetector(Node):
                             # 仍然保留，但限定范围
                             field_x = max(0, min(28, field_x))
                             field_y = max(0, min(15, field_y))
-
+                        
                         # ★ 卡尔曼滤波平滑坐标
                         field_x, field_y = self.kf_wrapper.update(
                             car_id, field_x, field_y)

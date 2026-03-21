@@ -2,7 +2,7 @@
 global:
   my_color: "Red" # "Blue"
   is_debug: True # False
-  scene: "lab"  # "competition" = 赛场（28x15m）| "lab" = 实验室测试
+  scene: "competition"  # "competition" = 赛场（28x15m）| "lab" = 实验室测试
   # 调试坐标发布开关
   # true  = 调试模式: 地面方案二和空中检测的所有坐标都经 location→EKF 发布（含非标准ID映射）
   # false = 赛场模式: 仅标准 ID (1-7/101-107) 经 EKF 发布, 其余全部丢弃, 杜绝干扰项
@@ -33,7 +33,7 @@ scenes:
 # 相机输入配置（仅用于纯相机透视变换方案 camera_detector）
 camera:
   mode: "video"               # "test": 测试模式(静态图片) | "video": USB摄像头/视频文件 | "hik": 海康工业相机
-  video_source: /data/projects/radar/hnurm_radar/test_resources/7.27-华东理工.mp4             # video 模式下的输入源：0=USB摄像头, 或视频文件路径如 "/path/to/video.mp4"
+  video_source:  /home/qnl/test_videos/video2_cut.mp4              # video 模式下的输入源：0=USB摄像头, 或视频文件路径如 "/path/to/video.mp4"
   test_image: "test_resources/red1.png"  # test 模式下使用的图片路径（相对于项目根目录）
 
 

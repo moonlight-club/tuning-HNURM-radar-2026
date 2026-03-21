@@ -37,7 +37,7 @@ class VideoPublisher(Node):
         )
         self.last = time.time()
         self.publisher_ = self.create_publisher(Image, 'image', qos_profile)
-        self.timer = self.create_timer(0.033, self.timer_callback)
+        self.timer = self.create_timer(0.033, self.timer_callback) # 这里可以更改视频发布的频率，即视频播放速度，越小越快，单位为秒
         self.cap = cv2.VideoCapture(video_file)
         self.bridge = CvBridge()
         self.get_logger().info('Publishing video from: %s' % video_file)

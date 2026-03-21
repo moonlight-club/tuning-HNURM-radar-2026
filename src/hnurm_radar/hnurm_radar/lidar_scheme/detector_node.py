@@ -441,24 +441,32 @@ class Detector(Node):
                                 result[0][1] = int(result[0][1] * 2048 / 1080)
                                 result[0][2] = int(result[0][2] * 3072 / 1920)
                                 result[0][3] = int(result[0][3] * 2048 / 1080)
-                                
+
                                 result[1][0] = int(result[1][0] * 3072 / 1920)
                                 result[1][1] = int(result[1][1] * 2048 / 1080)
                                 result[1][2] = int(result[1][2] * 3072 / 1920)
                                 result[1][3] = int(result[1][3] * 2048 / 1080)
-                                
-                                
+
                                 msg.xyxy_box = result[0]
                                 # print(result[1])
                                 msg.xywh_box = [float(x) for x in result[1]]
                                 msg.track_id = result[2]
                                 msg.label = result[3]
                                 allRobots.detect_results.append(msg)
-                        cv2.imshow("Window", cv_image)
+
+                        # 发布检测可视化图像到 detect_view
+                        if result_img is not None:
+                            img_msg = self.bridge.cv2_to_imgmsg(result_img, encoding='bgr8')
+                            self.pub_res.publish(img_msg)
+                            cv2.imshow("Window", result_img)
+                        else:
+                            img_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
+                            self.pub_res.publish(img_msg)
+                            cv2.imshow("Window", cv_image)
                         cv2.waitKey(1)
                 else:
                     cv2.imshow("Window", cv_image)
-                
+
                 self.publisher_.publish(allRobots)
         
             except Exception as e:

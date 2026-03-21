@@ -56,6 +56,21 @@ v_next_y =  0    +  v_cur_y          +   a_y * delta_t        #--->    [    delt
 (2) P_next = F_k * P_cur * F_k_T  + Q_k        # 估计值协方差矩阵 方程
 这两个公式代表了卡尔曼滤波器中的预测部分,是卡尔曼滤波器五个基础公式中的前两个.
 (3),(4),(5)详见tinyekf包
+
+
+
+tunning:
+    2026-3-17 -增加predict-only方法,用于遮挡预测,并修正了相关逻辑
+              -修改日志发布频次，避免过多日志阻塞定时器
+
+    详细修改信息请参见:
+    1. RobotInfo.calculateInfo() - 添加速度保存，供下一帧计算加速度
+    2. timer_callback() - 添加locations_queue清零逻辑，防止数据复用
+    3. timer_callback() - 修正条件逻辑，补全predict-only分支（无观测时预测）
+    4. timer_callback() - 修正历史队列更新，仅有观测时才保存
+    5. RobotEKF - 新增predict_only()和state属性，支持遮挡预测
+    6. RobotEKF.stateTransitionFunction() - 高频print改为条件化日志
+    7. timer_callback() - 日志等级info改为debug，避免阻塞定时器
 """
 import math
 import numpy as np
@@ -104,9 +119,12 @@ class RobotEKF(EKF):
                                    int(tt/2 * self.acceleration_y),
                                    int(self.interval * self.acceleration_y)
                                     ))
-            print(f"stateTransitionFunction: B_k_dot_u_k={B_k_dot_u_k}")
-
-            # X_k = F_k * X_k-1 + B_k * u_k
+            # tunning: 改为每 N 帧打印一次，降低日志频率
+            if not hasattr(self, '_print_counter'):
+                self._print_counter = 0
+            self._print_counter += 1
+            if self._print_counter % 20 == 0:  # 每 20 帧打印一次（降低到 1Hz）
+                print(f"stateTransitionFunction: B_k_dot_u_k={B_k_dot_u_k}")
             new_x = F_k.dot(x) + B_k_dot_u_k
         else:
             new_x = F_k.dot(x)
@@ -119,3 +137,20 @@ class RobotEKF(EKF):
         H_k = np.eye(self.measurementCount)  # 状态值转换为测量值的函数为: y= f(x) = x,基本是恒等关系,故返回一个单位矩阵
         return H_k.dot(x), H_k   # 同时返回经状态转换函数变换后的测量值^: H_k(mxn) * X(nx1) = ZZ_k(mx1)
 
+    def predict_only(self):
+        """
+        tunning: 仅执行预测步骤，不进行观测更新
+        用于目标被遮挡但需要继续预测的场景
+        """
+        # tunning: 执行状态转移预测
+        self.x, F_k = self.stateTransitionFunction(self.x)
+        # tunning: 更新预测协方差矩阵
+        self.P_current = F_k @ self.P_result @ F_k.T + self.Q_k
+        # tunning: 保存当前协方差供下次使用
+        self.P_result = self.P_current
+        return self.x
+
+    @property
+    def state(self):
+        """tunning: 属性方法，获取当前状态向量"""
+        return self.x

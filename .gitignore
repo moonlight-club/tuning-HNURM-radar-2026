@@ -75,3 +75,13 @@ docs/COORDINATE_TRANSFORM_COMPARISON.md
 docs/COORDINATE_TRANSFORM_EXPLANATION.md
 docs/AIR_TARGET_INTEGRATION.md
 docs/AIR_SCHEME_GUIDE.md
+frames_2026-03-14_22.00.13.gv
+frames_2026-03-14_22.00.13.pdf
+frames_2026-03-14_22.09.37.gv
+frames_2026-03-14_22.09.37.pdf
+test_tools/bag2txt.py
+test_tools/check_calibration.py
+scripts/evaluate_quatro_error.py
+scripts/check_relocalation_tf.py
+scripts/lidar_cam_projection_debug.py
+scripts/live_icp_debugger.py

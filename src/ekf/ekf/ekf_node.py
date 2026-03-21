@@ -25,9 +25,13 @@ ekf_node.py — 扩展卡尔曼滤波（EKF）节点
 依赖：
   - ekf.RobotEKF — 基于 tinyekf 的 EKF 实现
   - detect_result.msg — Location / Locations 自定义消息
+
+tunning 说明：
+    - 2025-03-17: 初始修改版本，在time!=0时仍执行predict-only，修正历史队列更新逻辑
 """
 
 import os
+import time  # tunning: 新增 time 模块，用于遮挡预测的超时控制
 
 import rclpy
 from rclpy.node import Node
@@ -74,8 +78,7 @@ class RobotInfo(object):
     def calculateInfo(self, last_info):
 
         if last_info.x > 0 and last_info.y > 0:
-            t = (self.time - last_info.time) # 转s
-
+            t = (self.time - last_info.time) / 1000.0  # tunning: ms转s
             if abs(t) < 1e-6:  # 避免除零
                 return
 
@@ -84,6 +87,10 @@ class RobotInfo(object):
 
             self.a_x = (self.v_x - last_info.v_x) / t
             self.a_y = (self.v_y - last_info.v_y) / t
+
+            # tunning: 保存当前速度供下一帧计算加速度
+            self.last_v_x = self.v_x
+            self.last_v_y = self.v_y
 
 
 
@@ -155,9 +162,17 @@ class EKFNode(Node):
 
     # 定时器回调函数    
     def timer_callback(self):
-        self.get_logger().info(f"Timestamp: {self.get_clock().now()}, Location: {self.recv_location.__str__()}")
+        # tuning： timer_callback 改为 DEBUG，不阻塞定时器的正常运行，保留时间戳输出以便调试
+        # 运行时控制日志级别： ros2 run ekf_node --ros-args --log-level ekf_node:=INFO  # 隐藏 DEBUG
+        self.get_logger().debug(f"Timestamp: {self.get_clock().now()}")  # 只在调试时打印
+
+
         # self.get_logger().info(f"Timestamp: {self.get_current_time_ms()}, Location: {self.recv_location.__str__()}")
         locations = self.recv_location
+
+            # tunning: 清空本帧的观测时间戳，防止上一帧数据被复用
+        for i in range(7):
+            self.locations_queue[1][i].time = 0
         # 更新测量值
         for i in range(len(locations.locs)):
             location = locations.locs[i]
@@ -186,25 +201,55 @@ class EKFNode(Node):
         estimated_locations = [[0,0,0,0], [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]]
         # 对每个机器人进行卡尔曼滤波
         for i in range(len(self.locations_queue[0])):
-            # 如果没有新的数据,则跳过
-            if self.locations_queue[1][i].time == 0:
-                continue
-            # 计算加速度
-            self.locations_queue[1][i].calculateInfo(self.locations_queue[0][i])
-            self.kalfilt[i].update_acceleration(self.locations_queue[1][i].a_x, self.locations_queue[1][i].a_y)
-            estimated_locations[i] = (self.kalfilt[i].step((self.locations_queue[1][i].x, self.locations_queue[1][i].v_x, self.locations_queue[1][i].y, self.locations_queue[1][i].v_y)))
+         # tunning: BUG FIX 核心改动——修正条件判断逻辑，启用predict-only模式
+            # 原代码: if self.locations_queue[1][i].time == 0: continue
+            # 问题: time==0表示无新观测，却跳过整个滤波，导致无观测时不做预测
+            # 改正: 改为 if self.locations_queue[1][i].time != 0，有新观测才进行 update
+            if self.locations_queue[1][i].time != 0:
+                # 有新观测：执行完整的 update 步骤
+                # 计算加速度
+                self.locations_queue[1][i].calculateInfo(self.locations_queue[0][i])
+                self.kalfilt[i].update_acceleration(self.locations_queue[1][i].a_x, self.locations_queue[1][i].a_y)
+                estimated_locations[i] = (self.kalfilt[i].step((self.locations_queue[1][i].x, self.locations_queue[1][i].v_x, self.locations_queue[1][i].y, self.locations_queue[1][i].v_y)))
+            else:
+                # tunning: 无新观测时，EKF 自动进行 predict-only
+                estimated_locations[i] = self.kalfilt[i].predict_only()
             
-        ## 保存历史位置（每帧更新，用于下一帧速度/加速度计算） 等测试完成之后再考虑优化
+        ## tunning: BUG FIX 历史队列更新逻辑反转
+        # 原代码: if self.locations_queue[1][i].time == 0: 保存历史
+        # 问题: 逻辑反了！time==0表示无观测，不应该保存
+        #       这导致历史队列被无观测数据污染，下一帧计算速度/加速度就错了
+        # 改正: 改为 if self.locations_queue[1][i].time != 0，只在有新观测时保存历史
         for i in range(len(self.locations_queue[0])):
-            # if self.locations_queue[1][i].time > 0:
-            if self.locations_queue[1][i].time == 0:
+            if self.locations_queue[1][i].time != 0:
                 self.locations_queue[0][i].time = self.locations_queue[1][i].time
                 self.locations_queue[0][i].x = self.locations_queue[1][i].x
                 self.locations_queue[0][i].y = self.locations_queue[1][i].y
                 self.locations_queue[0][i].z = self.locations_queue[1][i].z
-                # self.locations_queue[0][i].v_x = self.locations_queue[1][i].v_x # 等测试完成之后再考虑优化
-                # self.locations_queue[0][i].v_y = self.locations_queue[1][i].v_y # 等测试完成之后再考虑优化
-        self.get_logger().info(f"Estimated locations: {estimated_locations}")
+                self.locations_queue[0][i].v_x = self.locations_queue[1][i].v_x
+                self.locations_queue[0][i].v_y = self.locations_queue[1][i].v_y
+            self.get_logger().debug(f"Estimated locations: {estimated_locations}") # tunning: 等级降级为DEBUG,防止阻塞定时器
+        #     # 如果没有新的数据,则跳过
+        #     if self.locations_queue[1][i].time == 0:
+        #         continue
+        #     # 计算加速度
+        #     self.locations_queue[1][i].calculateInfo(self.locations_queue[0][i])
+        #     self.kalfilt[i].update_acceleration(self.locations_queue[1][i].a_x, self.locations_queue[1][i].a_y)
+        #     estimated_locations[i] = (self.kalfilt[i].step((self.locations_queue[1][i].x, self.locations_queue[1][i].v_x, self.locations_queue[1][i].y, self.locations_queue[1][i].v_y)))
+            
+        # ## 保存历史位置（每帧更新，用于下一帧速度/加速度计算） 等测试完成之后再考虑优化
+        # for i in range(len(self.locations_queue[0])):
+        #     # if self.locations_queue[1][i].time > 0:
+        #     if self.locations_queue[1][i].time == 0:
+        #         self.locations_queue[0][i].time = self.locations_queue[1][i].time
+        #         self.locations_queue[0][i].x = self.locations_queue[1][i].x
+        #         self.locations_queue[0][i].y = self.locations_queue[1][i].y
+        #         self.locations_queue[0][i].z = self.locations_queue[1][i].z
+        #         # self.locations_queue[0][i].v_x = self.locations_queue[1][i].v_x # 等测试完成之后再考虑优化
+        #         # self.locations_queue[0][i].v_y = self.locations_queue[1][i].v_y # 等测试完成之后再考虑优化
+        
+        
+        
         
         # 发布滤波后的位置信息
         # 数组下标到 ID 的映射:

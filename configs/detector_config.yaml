@@ -20,5 +20,12 @@ filter:
   max_velocity: 5.0            # 最大移动速度 (m/s)，超过则拒绝观测
   max_inactive_time: 3.0       # 滤波器超时清理时间 (s)
 
+# 匈牙利匹配tracker参数
+track:
+  iou_thr: 0.05                # IoU 门控下限
+  dist_thr: 200                # 中心距离门控（像素）
+  max_miss: 3                  # 允许连续未匹配帧数
+  publish_predict_when_no_det: true  # 无检测时是否发布预测/历史位置
+  
 is_record: true
 record_fps: 60

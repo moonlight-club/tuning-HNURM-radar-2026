@@ -19,9 +19,9 @@
     # 匹配点对的最大距离的平方，用于剔除错误匹配
     max_dist_sq: 0.5
     # 对实时点云（源）进行体素降采样的栅格大小（米）
-    source_voxel_size: 0.25
+    source_voxel_size: 0.25 # 原：0.25
     # 对地图点云（目标）进行体素降采样的栅格大小（米）
-    map_voxel_size: 0.25
+    map_voxel_size: 0.25 # 原：0.25
 
     # 是否使用固定的地图文件进行配准 (Lidar-to-Map)
     use_fixed: true
