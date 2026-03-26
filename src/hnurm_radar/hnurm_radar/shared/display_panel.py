@@ -73,23 +73,30 @@ class DisplayPanel(Node):
             is_air_robot = location.id in (6, 106) or location.id >= 600
             air_suffix = " UAV" if is_air_robot else ""
             
+            # // tunning: 接收暗号，判断是否为视觉推演的“幽灵点”
+            is_guessing = (z < 0.0)
+
             if location.label == 'Red':
                 x = 28 - x
                 y = 15 - y
                 xx = 2800 - xx
                 yy = 1500 - yy
-                color = (0, 0, 255)  # 红色
+                # // tunning: 如果是盲猜点，画紫色 (BGR格式: 255, 0, 255)；否则画红色
+                color = (255, 0, 255) if is_guessing else (0, 0, 255)  
+                
                 cv2.putText(show_map, str(location.id) + air_suffix, (xx - 15, yy + 10), cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4)
                 cv2.putText(show_map, str((x)) + ',' + str((y)) + ',' + str(z), (xx, yy - 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
                 if is_air_robot:
-                    # 空中机器人用菱形标记 + 显示高度
                     pts = np.array([[xx, yy-50], [xx+50, yy], [xx, yy+50], [xx-50, yy]], np.int32)
                     cv2.polylines(show_map, [pts], True, color, 3)
                     cv2.putText(show_map, f"h={z:.1f}m", (xx + 55, yy + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 else:
                     cv2.circle(show_map, (xx, yy), 60, color, 4)
+                    
             elif location.label == 'Blue':
-                color = (255, 0, 0)  # 蓝色
+                # // tunning: 蓝方盲猜点画青蓝色 (BGR: 255, 255, 0) 以示区分，正常画蓝色
+                color = (255, 255, 0) if is_guessing else (255, 0, 0)  
+                
                 cv2.putText(show_map, str(location.id) + air_suffix, (xx - 15, yy + 10), cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4)
                 cv2.putText(show_map, str((x)) + ',' + str((y)) + ',' + str(z), (xx, yy - 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
                 if is_air_robot:

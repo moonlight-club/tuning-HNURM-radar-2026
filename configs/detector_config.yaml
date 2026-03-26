@@ -13,18 +13,32 @@ params:
   life_time: 90 # 生命周期
 
 # 坐标卡尔曼滤波器参数
+# ---[修改前]---
+# filter:
+#   process_noise: 0.005         # 过程噪声系数（越小越平滑，响应越慢）
+#   measurement_noise: 0.15      # 观测噪声系数（越大越信赖预测值）
+#   jump_threshold: 1.0          # 单帧跳变阈值 (m)，超过则拒绝更新
+#   max_velocity: 5.0            # 最大移动速度 (m/s)，超过则拒绝观测
+#   max_inactive_time: 3.0       # 滤波器超时清理时间 (s)
+
+# --- [修改后] ---
 filter:
-  process_noise: 0.005         # 过程噪声系数（越小越平滑，响应越慢）
-  measurement_noise: 0.15      # 观测噪声系数（越大越信赖预测值）
-  jump_threshold: 1.0          # 单帧跳变阈值 (m)，超过则拒绝更新
-  max_velocity: 5.0            # 最大移动速度 (m/s)，超过则拒绝观测
-  max_inactive_time: 3.0       # 滤波器超时清理时间 (s)
+  # // tunning: ★ 彻底逆转 Q/R 信任链，强制消除 1m 相位滞后
+  process_noise: 0.1           # [原 0.005] 过程噪声 Q。调大此值，告诉滤波器 RM 机器人具备极高动态的变速/变向能力，不要过度相信运动学预测。
+  measurement_noise: 0.02      # [原 0.15] 观测噪声 R。调小此值，强制系统在有检测框时，极度信任 YOLO 透视变换后的物理坐标。
+  jump_threshold: 1.5          # [原 1.0] 单帧跳变阈值 (m)。适当放宽，防止低帧率下机器人的合法大位移被当成“瞬移噪音”而拒绝更新。
+  max_velocity: 6.0            # [原 5.0] 最大移动速度 (m/s)。RM 步兵/英雄在全功率加速时可达 4~5m/s，放宽至 6.0m/s 防止高速移动时坐标卡死。
+  max_inactive_time: 3.0       # [原 3.0] 滤波器超时清理时间 (s)。保持不变，与追踪器的 max_miss 兜底逻辑对齐。
 
 # 匈牙利匹配tracker参数
 track:
   iou_thr: 0.05                # IoU 门控下限
   dist_thr: 200                # 中心距离门控（像素）
-  max_miss: 3                  # 允许连续未匹配帧数
+  lost_thr: 0                  # 漏检1~3帧(0~0.1s)：防闪烁，维持像素短时预测并锁死物理速度
+  guess_thr: 3                 # 漏检>3帧(>0.1s)：抛弃像素预测，立刻触发赛场物理坐标系惯性滑行
+  max_miss: 84                 # 漏检>84帧(>2.8s)：盲猜滑行至2.8s后彻底清除目标内存
+  decay_factor: 0.94           # // tunning: 盲猜速度衰减系数 (越小滑行距离越短)
+  max_guess_sec: 2.8           # // tunning: 盲猜最长持续时间 (秒)，应与 max_miss 对应
   publish_predict_when_no_det: true  # 无检测时是否发布预测/历史位置
   
 is_record: true
