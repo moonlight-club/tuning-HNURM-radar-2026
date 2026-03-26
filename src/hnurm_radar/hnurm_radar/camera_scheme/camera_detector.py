@@ -188,16 +188,20 @@ class CameraDetector(Node):
         self._load_or_calibrate_homography()
         self._load_mask()
 
-        # ---------- 坐标卡尔曼滤波器 ----------
-        filter_cfg = self.det_cfg.get('filter', {})
-        self.kf_wrapper = KalmanFilterWrapper(
-            process_noise=float(filter_cfg.get('process_noise', 1e-2)),
-            measurement_noise=float(filter_cfg.get('measurement_noise', 1e-1)),
-            jump_threshold=float(filter_cfg.get('jump_threshold', 1.0)),
-            max_velocity=float(filter_cfg.get('max_velocity', 5.0)),
-            max_inactive_time=float(filter_cfg.get('max_inactive_time', 3.0)),
-        )
-        self._cleanup_counter = 0
+       # ---------- 坐标卡尔曼滤波器 ----------
+        # 修改：注释kalman_filter 开始
+        # filter_cfg = self.det_cfg.get('filter', {})
+        # self.kf_wrapper = KalmanFilterWrapper(
+        #     process_noise=float(filter_cfg.get('process_noise', 1e-2)),
+        #     measurement_noise=float(filter_cfg.get('measurement_noise', 1e-1)),
+        #     jump_threshold=float(filter_cfg.get('jump_threshold', 1.0)),
+        #     max_velocity=float(filter_cfg.get('max_velocity', 5.0)),
+        #     max_inactive_time=float(filter_cfg.get('max_inactive_time', 3.0)),
+        # )
+        # self._cleanup_counter = 0
+        # 修改：注释kalman_filter 结束
+
+        
 
         # ---------- 小地图 ----------
         self.map_img = cv2.imread(MAP_IMAGE_PATH)
@@ -485,8 +489,9 @@ class CameraDetector(Node):
         重置跟踪器和滤波器状态。
         在视频循环播放时调用，避免状态残留导致坐标错误。
         """
-        # 重置卡尔曼滤波器
-        self.kf_wrapper.reset()
+        # 修改：注释kalman_filter 开始
+        # # 重置卡尔曼滤波器
+        # self.kf_wrapper.reset()
 
         # 重置跟踪投票表和状态
         for i in range(10000):
@@ -823,9 +828,10 @@ class CameraDetector(Node):
                         field_x = max(0.0, min(28.0, field_x))
                         field_y = max(0.0, min(15.0, field_y))
 
-                        field_x, field_y = self.kf_wrapper.update(car_id, field_x, field_y)
-                        field_x = max(0.0, min(28.0, field_x))
-                        field_y = max(0.0, min(15.0, field_y))
+                        # 修改：注释kalman_filter 开始
+                        # field_x, field_y = self.kf_wrapper.update(car_id, field_x, field_y)
+                        # field_x = max(0.0, min(28.0, field_x))
+                        # field_y = max(0.0, min(15.0, field_y))
 
                         field_xyz = np.array([field_x, field_y, 0.0])
 
@@ -902,11 +908,11 @@ class CameraDetector(Node):
                     # 此时 allLocation 已经包含了“观测点”和“盲猜点”
                     self.pub_location.publish(allLocation)
 
-                  
-                # ★ 定期清理超时的卡尔曼滤波器
-                self._cleanup_counter += 1
-                if self._cleanup_counter % 100 == 0:
-                    self.kf_wrapper.cleanup()
+                # 修改：注释kalman_filter 开始
+                # # ★ 定期清理超时的卡尔曼滤波器
+                # self._cleanup_counter += 1
+                # if self._cleanup_counter % 100 == 0:
+                #     self.kf_wrapper.cleanup()
 
                 # ---------- 在推理图像上显示 FPS ----------
                 cv2.putText(result_img, f"FPS: {fps:.1f}", (20, 40),
