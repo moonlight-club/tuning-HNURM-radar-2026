@@ -36,35 +36,27 @@ class PointGuesser:
         self.x_limit = (0.0, 28.0)
         self.y_limit = (0.0, 15.0)
 
-    def update(self, active_robots: list):
-        """
-        执行物理空间惯性推演。
-        输入 active_robots 需包含已由 camera_detector 计算的 field_vx/vy 字段。
-        """
+     # --- [修改后] ---
+    # // tunning: 接收主循环传来的动态真实时间差 dt
+    def update(self, active_robots: list, dt: float = 0.033):
         for robot in active_robots:
-            # 仅处理进入深度丢失（GUESSING）状态的目标
             if robot.state == TrackingState.GUESSING:
-
-                # // tunning: ★ 核心修复 - 增加空值保护，防止由于未初始化坐标导致的崩溃
                 if robot.field_x is None or robot.field_y is None:
                     continue
 
-                # 1. 检查丢失时长门控，超过阈值则跳过推演
-                lost_duration = robot.miss_cnt / self.fps
+                # // tunning: 使用实际动态时间步长计算丢失时间，更加严谨
+                lost_duration = robot.miss_cnt * dt
                 if lost_duration > self.max_guess_sec:
                     continue
 
-                # 2. 执行带衰减的运动学外推
                 if hasattr(robot, 'field_vx') and hasattr(robot, 'field_vy'):
-                    # 速度指数衰减，模拟不确定性增加
+                    # 速度衰减机制（可依据真实 dt 做进一步非线性优化，此处保持原有逻辑）
                     robot.field_vx *= self.decay_factor
                     robot.field_vy *= self.decay_factor
-                    
-                    # 位置更新 (绝对坐标系)
-                    robot.field_x += robot.field_vx * self.dt
-                    robot.field_y += robot.field_vy * self.dt
 
-                # 3. 强制物理边界约束，防止坐标溢出
-                # 边界预留 0.1m 安全距离
+                    # // tunning: 严格依据真实物理时间步 dt 执行积分位移
+                    robot.field_x += robot.field_vx * dt
+                    robot.field_y += robot.field_vy * dt
+
                 robot.field_x = max(0.1, min(self.x_limit[1] - 0.1, robot.field_x))
                 robot.field_y = max(0.1, min(self.y_limit[1] - 0.1, robot.field_y))

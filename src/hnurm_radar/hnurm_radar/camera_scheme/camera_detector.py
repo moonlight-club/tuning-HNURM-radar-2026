@@ -733,13 +733,19 @@ class CameraDetector(Node):
         cv2.namedWindow("MiniMap", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("MiniMap", 800, 471)
 
-        start_time = time.time()
+        # tunning:实时计算当前的帧数，而不是写死的 30fps，因为实际视频检测的帧数在15-25左右
+        # start_time = time.time()
+        start_time = time.perf_counter()
+
         # 推理用分辨率
         INFER_W, INFER_H = 1920, 1080
 
         while rclpy.ok():
-            now = time.time()
-            fps = 1.0 / max(now - start_time, 1e-6)
+            now = time.perf_counter()
+
+            # // tunning: 计算真实物理时间步长 dt，硬性限幅 [0.01, 0.1] (对应 100fps 到 10fps)
+            dt = max(0.01, min(0.1, now - start_time))
+            fps = 1.0 / max(dt, 1e-6)
             start_time = now
 
             try:
@@ -839,7 +845,7 @@ class CameraDetector(Node):
                             dx, dy = field_x - robot.field_x, field_y - robot.field_y
                             jump_dist = (dx**2 + dy**2)**0.5
                             if jump_dist < 0.3:
-                                raw_vx, raw_vy = dx / 0.033, dy / 0.033
+                                raw_vx, raw_vy = dx / dt, dy / dt
                                 robot.field_vx = 0.5 * getattr(robot, 'field_vx', 0.0) + 0.5 * raw_vx
                                 robot.field_vy = 0.5 * getattr(robot, 'field_vy', 0.0) + 0.5 * raw_vy
                         
@@ -872,8 +878,8 @@ class CameraDetector(Node):
                     # 此处放在循环外，确保所有可见机器人的 field_vx/vy 已更新完毕
                     # // tunning: ★ 只有敌方机器人才传给 guesser，己方不参与预测
                     enemies = [r for r in active_robots if getattr(r, 'is_enemy', False)]
-                    self.guesser.update(enemies)
- 
+                    # // tunning: 将动态物理时间步 dt 传递给推演器
+                    self.guesser.update(enemies, dt) 
 
                     # tunning: 5. 遍历列表，将处于 GUESSING 状态的推演坐标也压入发布队列
                     for robot in active_robots:

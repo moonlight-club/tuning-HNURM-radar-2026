@@ -32,11 +32,11 @@ class BBoxKalmanFilter(object):
         # F_k(n,n) * X^_k-1(n,1) --> x^_k(n,1) 新时刻状态向量
         self.F_k = np.eye(self.n)
         for i in range(self.m):
-            self.F_k[i, self.m + i] = dt
+            self.F_k[i, self.m + i] = 1.0
 
             # // tunning: ★ 引入预测阻尼（摩擦力），防止预测框因异常速度“飞出去”
-            # 对角线元素默认是 1 (v = v)。这里改为 0.85，意味着每推演一帧，像素速度会自动衰减 15%。这在保持预测方向的同时，强行截断了速度爆炸。
-            self.F_k[self.m + i, self.m + i] = 0.85
+            # 对角线元素默认是 1 (v = v)。这里改为 0.90，意味着每推演一帧，像素速度会自动衰减 10%。这在保持预测方向的同时，强行截断了速度爆炸。
+            self.F_k[self.m + i, self.m + i] = 0.90
 
         # 传感器测量值向量与预测值向量之间的线性转换矩阵 (观测矩阵)
         # m x n矩阵, H_k(mxn) * X(nx1) = ZZ_k(mx1)
@@ -144,6 +144,9 @@ class BBoxKalmanFilter(object):
         # 最终,最优预测状态向量值
         # (4). X^_k = X_k + K_k * (z_k - zz_k) 
         x_new = x + np.dot(K_k, (z - zz_k))
+
+        # // tunning: 底层状态硬钳制。限制像素速度 (vx, vy, vw, vh) 单帧最大变化量不超过 80 像素
+        x_new[4:] = np.clip(x_new[4:], -80, 80)
 
         # 最后,最优预测协方差矩阵
         # (5). P^_k = P_k - K_k * H_k * P_k = (I - K_k * H_k) * P_k
