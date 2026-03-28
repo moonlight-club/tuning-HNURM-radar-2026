@@ -26,6 +26,7 @@ from ..camera_locator.point_picker import PointsPicker
 from ..filters.kalman_filter import KalmanFilterWrapper
 from .hungarian_tracker import HungarianTracker  # tunning: 新增匈牙利关联模块导入
 from ..shared.type import SingleDetectionResult, TrackingState # tunning: 引入底层数据协议与状态机
+from ..shared.utils import nms_xywh, compute_iou, xywh2xyxy
 from .guess_pts import PointGuesser  # tunning: 引入长时间丢失惯性推演
 
 import cv2
@@ -105,13 +106,18 @@ class CameraDetector(Node):
         self.labels = self.det_cfg['params']['labels']
         self.class_num = len(self.labels)
 
-        # 追踪器投票表
-        self.Track_value = {}
-        self.Status = [0] * 10000
-        for i in range(10000):
-            self.Track_value[i] = [0] * self.class_num
-        self.id_candidate = [0] * 10000
+
+         # --- [修改后新增] ---
+        # // tunning: 注释掉前端冗余的追踪器投票表，彻底切断双大脑的记忆结构
         self.loop_times = 0
+
+        # # 追踪器投票表
+        # self.Track_value = {}
+        # self.Status = [0] * 10000
+        # for i in range(10000):
+        #     self.Track_value[i] = [0] * self.class_num
+        # self.id_candidate = [0] * 10000
+        # self.loop_times = 0
 
         # 灰色装甲板映射（与 detector_node 一致）
         self.Gray2Blue = {12: 5, 13: 1, 14: 0, 15: 3, 16: 2, 17: 4}
@@ -223,8 +229,10 @@ class CameraDetector(Node):
             iou_thr=float(track_params.get('iou_thr', 0.05)),
             dist_thr=float(track_params.get('dist_thr', 200)),
             max_miss=int(track_params.get('max_miss', 84)),    # // tunning: 最大容忍 84 帧 (2.8s)
-            lost_thr=int(track_params.get('lost_thr', 0)),     # // tunning: 浅层遮挡阈值
-            guess_thr=int(track_params.get('guess_thr', 3))    # // tunning: 深度遮挡物理推演阈值
+            # // tunning: 提升浅层丢失阈值至 3，允许 YOLO 连续漏检 3 帧而不改变 TRACKING 状态，消除高频震荡
+            lost_thr=int(track_params.get('lost_thr', 3)),     
+            # // tunning: 扩大盲猜介入阈值，拉开 LOST 与 GUESSING 的层级差距
+            guess_thr=int(track_params.get('guess_thr', 15))
         )
         # tunning: 当无检测时是否发布短期预测/历史位置信息（YAML 可配置）
         self.publish_predict_when_no_det = bool(self.det_cfg.get('publish_predict_when_no_det', True))
@@ -490,19 +498,21 @@ class CameraDetector(Node):
         在视频循环播放时调用，避免状态残留导致坐标错误。
         """
         # 修改：注释kalman_filter 开始
-        # # 重置卡尔曼滤波器
-        # self.kf_wrapper.reset()
+        # // tunning: 注释掉对废弃的 Track_value 和 Status 的重置
+     # for i in range(10000):
+     #     self.Track_value[i] = [0] * self.class_num
+     #     self.Status[i] = 0
+     # self.id_candidate = [0] * 10000
 
-        # 重置跟踪投票表和状态
-        for i in range(10000):
-            self.Track_value[i] = [0] * self.class_num
-            self.Status[i] = 0
-        self.id_candidate = [0] * 10000
+        # // tunning: 注释掉对 YOLO 内部 ByteTrack 追踪器的重置
+        # if hasattr(self.model_car, 'predictor') and self.model_car.predictor is not None:
+        #     if hasattr(self.model_car.predictor, 'trackers'):
+        #         self.model_car.predictor.trackers = None
 
-        # 重置 ByteTrack 跟踪器（通过清除 predictor 中的 trackers）
-        if hasattr(self.model_car, 'predictor') and self.model_car.predictor is not None:
-            if hasattr(self.model_car.predictor, 'trackers'):
-                self.model_car.predictor.trackers = None
+        # // tunning: 新增对后端唯一trcker维护者 HungarianTracker 的重置逻辑
+        if hasattr(self, 'hungarian'):
+            self.hungarian.tracks.clear()
+            self.hungarian.next_id = 1
 
         if self.is_debug:
             self.get_logger().info("跟踪器和滤波器状态已重置")
@@ -510,22 +520,26 @@ class CameraDetector(Node):
     # ================================================================
     #  YOLO 推理（复用已有 detector_node 的三阶段逻辑）
     # ================================================================
+    
+    # tunning：将YOLO降级为纯检测，不再维护tracker，track_id 由后端匈牙利关联模块分配
     def _is_results_empty(self, results):
         if results is None:
             return True
-        if results[0].boxes.id is None:
+        # // tunning: 废除 ByteTrack id 检查，只要检测到框就算不为空
+        if len(results[0].boxes) == 0:
             return True
         return False
 
     def _parse_results(self, results):
         confidences = results[0].boxes.conf.cpu().numpy()
         boxes = results[0].boxes.xywh.cpu().numpy()
-        track_ids = results[0].boxes.id.int().cpu().tolist()
+        # // tunning: 废弃 YOLO 的 track_id，前端只负责输出观测，ID 交由后端匈牙利分配
+        track_ids = [None] * len(boxes)
         return confidences, boxes, track_ids
 
-    def _track_infer(self, frame):
-        results = self.model_car.track(
-            frame, persist=True, tracker=self.tracker_path, verbose=False)
+    # // tunning: 将 _track_infer 改为 _predict_infer，不再调用 persist=True 和 tracker 黑盒
+    def _predict_infer(self, frame):
+        results = self.model_car.predict(frame, verbose=False)
         return results
 
     def _classify_infer(self, roi_list):
@@ -585,30 +599,35 @@ class CameraDetector(Node):
         return label_list, conf_list
 
     def _infer(self, frame):
-        """
-        三阶段推理（与 detector_node.infer 逻辑一致）
-        返回: (绘制后的图像, 结果列表)
-        结果列表中每个元素: [xyxy_box, xywh_box, track_id, label_str]
-        """
+      
+        """tunning: 纯检测推理阶段：仅负责检测 + 裁剪装甲板二三阶段分类。"""
         if frame is None:
             return None, None
-        results = self._track_infer(frame)
+        results = self._predict_infer(frame) # // tunning: 调用纯检测接口
         if self._is_results_empty(results):
             return frame, None
 
-        exist_armor = [-1] * (self.class_num + 6)
+        # // tunning: 注释掉冗余的同帧判重数组
+        # exist_armor = [-1] * (self.class_num + 6)
+
         draw_candidate = []
         confidences, boxes, track_ids = self._parse_results(results)
         zip_results = []
         roi_list = []
-        id_list = []
+        # id_list = []
         box_list = []
 
-        for box, track_id, conf in zip(boxes, track_ids, confidences):
-            if self.loop_times % self.life_time == 1:
-                for i in range(self.class_num):
-                    self.Track_value[int(track_id)][i] = math.floor(
-                        self.Track_value[int(track_id)][i] / 10)
+        # for box, track_id, conf in zip(boxes, track_ids, confidences)
+        # // tunning: 废除多余的 zip 解包，纯检测阶段只关心原始观测框的位置
+        for box in boxes:
+        # for box, track_id, conf in zip(boxes, track_ids, confidences):
+
+            # // tunning: 注释掉对 Track_value 投票表的时间衰减逻辑
+            # if self.loop_times % self.life_time == 1:
+            #     for i in range(self.class_num):
+            #         self.Track_value[int(track_id)][i] = math.floor(
+            #             self.Track_value[int(track_id)][i] / 10)
+
             x, y, w, h = box
             x_left = x - w / 2
             y_left = y - h / 2
@@ -616,7 +635,7 @@ class CameraDetector(Node):
             if roi.size == 0:
                 continue
             roi_list.append(roi)
-            id_list.append(track_id)
+            # id_list.append(track_id)
             box_list.append(box)
 
         if len(roi_list) == 0:
@@ -629,69 +648,75 @@ class CameraDetector(Node):
             return frame, None
 
         label_list, conf_list = classify_result
-        index = 0
+        # index = 0
         for i in range(len(roi_list)):
             classify_label = label_list[i]
             conf = conf_list[i]
-            track_id = id_list[i]
+            # track_id = id_list[i]
             box = box_list[i]
             x, y, w, h = box
-            status = 0
+            # status = 0
 
-            if classify_label != -1:
-                label = self.Track_value[int(track_id)].index(
-                    max(self.Track_value[int(track_id)]))
-                if classify_label > 11:  # Gray
-                    status = 1
-                    if self.Status[track_id] < 6:
-                        self.Status[track_id] += status
-                    if label < 6 and self.Gray2Blue.get(classify_label) == label:
-                        self.Track_value[int(track_id)][int(float(
-                            self.Gray2Blue[classify_label]))] += 0.5 + conf * 0.5
-                    elif label > 5 and self.Gray2Red.get(classify_label) == label:
-                        self.Track_value[int(track_id)][int(float(
-                            self.Gray2Red[classify_label]))] += 0.5 + conf * 0.5
-                    else:
-                        classify_label = -1
-                else:
-                    if self.Status[int(track_id)] > 0:
-                        self.Status[int(track_id)] -= 1
-                    if self.Status[int(track_id)] < 4:
-                        self.Status[int(track_id)] = 0
-                    # 高置信度纠正：当前帧分类与投票结果不一致时，加大权重
-                    vote_weight = 0.5 + conf * 0.5
-                    if conf > 0.85 and label != int(float(classify_label)) and max(self.Track_value[int(track_id)]) > 0:
-                        vote_weight = 2.0 + conf * 2.0  # 高置信度不一致时给 4 倍权重纠正
-                    self.Track_value[int(track_id)][int(float(
-                        classify_label))] += vote_weight
+            # if classify_label != -1:
+            #     label = self.Track_value[int(track_id)].index(
+            #         max(self.Track_value[int(track_id)]))
+            #     if classify_label > 11:  # Gray
+            #         status = 1
+            #         if self.Status[track_id] < 6:
+            #             self.Status[track_id] += status
+            #         if label < 6 and self.Gray2Blue.get(classify_label) == label:
+            #             self.Track_value[int(track_id)][int(float(
+            #                 self.Gray2Blue[classify_label]))] += 0.5 + conf * 0.5
+            #         elif label > 5 and self.Gray2Red.get(classify_label) == label:
+            #             self.Track_value[int(track_id)][int(float(
+            #                 self.Gray2Red[classify_label]))] += 0.5 + conf * 0.5
+            #         else:
+            #             classify_label = -1
+            #     else:
+            #         if self.Status[int(track_id)] > 0:
+            #             self.Status[int(track_id)] -= 1
+            #         if self.Status[int(track_id)] < 4:
+            #             self.Status[int(track_id)] = 0
+            #         # 高置信度纠正：当前帧分类与投票结果不一致时，加大权重
+            #         vote_weight = 0.5 + conf * 0.5
+            #         if conf > 0.85 and label != int(float(classify_label)) and max(self.Track_value[int(track_id)]) > 0:
+            #             vote_weight = 2.0 + conf * 2.0  # 高置信度不一致时给 4 倍权重纠正
+            #         self.Track_value[int(track_id)][int(float(
+            #             classify_label))] += vote_weight
 
-            label = self.Track_value[int(track_id)].index(
-                max(self.Track_value[int(track_id)]))
+            # label = self.Track_value[int(track_id)].index(
+            #     max(self.Track_value[int(track_id)]))
 
-            # 判重
-            if label < len(exist_armor) and exist_armor[label] != -1:
-                old_id = exist_armor[label]
-                if self.Track_value[int(track_id)][label] < self.Track_value[int(old_id)][label]:
-                    self.Track_value[int(track_id)][label] = 0
-                    label = "NULL"
-                else:
-                    self.Track_value[int(old_id)][label] = 0
-                    old_id_index = self.id_candidate[old_id]
-                    if old_id_index < len(draw_candidate):
-                        draw_candidate[old_id_index][5] = "NULL"
-                    exist_armor[label] = track_id
-            else:
-                if label < len(exist_armor):
-                    exist_armor[label] = track_id
+            # # 判重
+            # if label < len(exist_armor) and exist_armor[label] != -1:
+            #     old_id = exist_armor[label]
+            #     if self.Track_value[int(track_id)][label] < self.Track_value[int(old_id)][label]:
+            #         self.Track_value[int(track_id)][label] = 0
+            #         label = "NULL"
+            #     else:
+            #         self.Track_value[int(old_id)][label] = 0
+            #         old_id_index = self.id_candidate[old_id]
+            #         if old_id_index < len(draw_candidate):
+            #             draw_candidate[old_id_index][5] = "NULL"
+            #         exist_armor[label] = track_id
+            # else:
+            #     if label < len(exist_armor):
+            #         exist_armor[label] = track_id
 
-            pd = self.Track_value[int(track_id)][0]
-            same = True
-            for j in range(self.class_num - 1):
-                if pd != self.Track_value[int(track_id)][j + 1]:
-                    same = False
-                    break
-            if not same and label != "NULL":
-                label = str(self.labels[label])
+            # pd = self.Track_value[int(track_id)][0]
+            # same = True
+            # for j in range(self.class_num - 1):
+            #     if pd != self.Track_value[int(track_id)][j + 1]:
+            #         same = False
+            #         break
+            # if not same and label != "NULL":
+            #     label = str(self.labels[label])
+            # else:
+            #     label = "NULL"
+
+            # // tunning: 新增纯净的瞬时观测输出逻辑，直接将当前帧分类结果转为字符串 label
+            if classify_label != -1 and classify_label < len(self.labels):
+                label = str(self.labels[int(classify_label)])
             else:
                 label = "NULL"
 
@@ -701,19 +726,27 @@ class CameraDetector(Node):
             y_right = int(y + h / 2)
             xywh_box = [x, y, w, h]
             xyxy_box = [x_left, y_left, x_right, y_right]
+
+            # // tunning: 强制清空前端 ID，ID判定彻底移交后端匈牙利 tracker
+            track_id = None
+
+            # // tunning: 将分类器输出的真实置信度 conf 压入结果列表，取消硬编码 1.0
             draw_candidate.append([track_id, x_left, y_left, x_right, y_right, label])
-            zip_results.append([xyxy_box, xywh_box, track_id, label])
-            self.id_candidate[track_id] = index
-            index += 1
+            zip_results.append([xyxy_box, xywh_box, track_id, label, conf])
+            
+            # self.id_candidate[track_id] = index
+            # index += 1
 
         # 在图像上画出检测结果
         for box in draw_candidate:
             tid, x1, y1, x2, y2, lbl = box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 128, 0), 3)
-            cv2.putText(frame, lbl, (x1 - 10, y2 + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 122), 2)
-            cv2.putText(frame, str(tid), (x2 + 5, y2 + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 122), 2)
+            # cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 128, 0), 3)
+            cv2.putText(frame, f"raw:{lbl}", (x1 , y2 + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 122), 2)
+            
+            # // tunning: 注释掉在画面上绘制前端 track_id，交给匈牙利匹配后主循环绘制
+            # cv2.putText(frame, str(tid), (x2 + 5, y2 + 5),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 122), 2)
 
         self.loop_times += 1
         return frame, zip_results
@@ -766,20 +799,44 @@ class CameraDetector(Node):
                 # ---------- 透视变换 + 发布 ----------
                 allLocation = Locations()
                 carList_results = []
+                detections = []
 
                 if results is not None:
                     # ==========================================
                     # tunning: 1. 数据标准化：将 YOLO 结果打包为基建协议格式
                     # ==========================================
-                    detections = []
-                    if results is not None:
-                        for res in results:
-                            xyxy_box, xywh_box, track_id, label = res
+                    raw_boxes = []
+                    raw_scores = []
+                    raw_data = []
+
+                    # 第一遍：收集所有原始观测数据
+                    for res in results:
+                        xyxy_box, xywh_box, track_id, label, conf = res
+                        raw_boxes.append(xywh_box)
+                        raw_scores.append(conf)
+                        raw_data.append(res)
+
+                    # --- ★ 修复点 1：把这里的 if 挪到 for 循环外面！ ---
+                    if len(raw_boxes) > 0:
+                        # 执行前端去重
+                        keep_indices = nms_xywh(
+                            np.array(raw_boxes), 
+                            np.array(raw_scores), 
+                            iou_threshold=0.45
+                        )
+
+                        # 第二遍：仅将去重后的高质量观测转化为标准化格式
+                        for idx in keep_indices:
+                            xyxy_box, xywh_box, track_id, label, conf = raw_data[idx]
+                            
+                            # 身份权重抑制
+                            effective_conf = float(conf) if label != "NULL" else 0.05
+                            
                             detections.append(SingleDetectionResult(
                                 xyxy=xyxy_box,
                                 xywh=xywh_box,
                                 label=label,
-                                conf=1.0,  # tunning: 此处复用已过滤好的框，默认给1.0
+                                conf=effective_conf,
                                 track_id=track_id
                             ))
 
@@ -815,7 +872,7 @@ class CameraDetector(Node):
                         robot.is_enemy = is_enemy # 标记身份，给后面的 guesser 用
 
                         # ==========================================
-                        # 你原有的核心坐标计算逻辑 (保持原封不动，确保 field_x 不为 None)
+                        # 核心坐标计算逻辑 (保持原封不动，确保 field_x 不为 None)
                         # ==========================================
                         kf_cx, kf_cy, kf_w, kf_h = robot.bbox_kf_state[:4]
                         orig_cx = kf_cx * ORIG_W / INFER_W
@@ -855,12 +912,49 @@ class CameraDetector(Node):
                         is_my_7 = (self.my_color == "Red" and car_id == 7) or \
                                   (self.my_color == "Blue" and car_id == 107)
                         
-                        if is_enemy or is_my_7:
-                            # 标注、组装 CarList、记录 ID
-                            cv2.putText(result_img, f"({field_x:.1f},{field_y:.1f}) {robot.state.name}",
-                                        (int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0) - 10), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        # ==========================================
+                        # ★ 仅修改此处：分阵营、分状态画图
+                        # ==========================================
+                        k_x1, k_y1 = int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0)
+                        k_x2, k_y2 = int(kf_cx + kf_w / 2.0), int(kf_cy + kf_h / 2.0)
+
+                        should_draw = False
+                        box_color = (0, 0, 0)
+
+                        if kf_w <= 2.0 or kf_h <= 2.0:
+                            # 如果宽或高已经预测成负数或小到看不见，说明已经缩到极点，跳过画图
+                            continue
+                        
+                        if is_enemy:
+                            # 敌方：Tracking 黄色 (0, 255, 255)，Lost 洋红色 (255, 0, 255)
+                            should_draw = True
+                            box_color = (0, 255, 255) if robot.state == TrackingState.TRACKING else (255, 0, 255)
+                        elif is_my_7:
+                            # 己方 7 号：Tracking 蓝色 (255, 0, 0)，Lost 洋红色 (255, 0, 255)
+                            should_draw = True
+                            box_color = (255, 0, 0) if robot.state == TrackingState.TRACKING else (255, 0, 255)
+                        else:
+                            # 普通己方 (1-6)：仅在 Tracking 时画蓝色 (255, 0, 0)，Lost 时消失
+                            if robot.state == TrackingState.TRACKING:
+                                should_draw = True
+                                box_color = (255, 0, 0)
+
+                        if should_draw:
+                            # 1. 绘制矩形框
+                            cv2.rectangle(result_img, (k_x1, k_y1), (k_x2, k_y2), box_color, 2)
+
+                            # 2. 绘制 ID 标签 (原 ID 位置)
+                            display_label = best_label if best_label != "NULL" else f"NULL-{robot.id}"
+                            cv2.putText(result_img, display_label, (k_x1, k_y1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                            # 3. 绘制坐标与状态 (上方小字)
+                            state_info = f"({field_x:.1f},{field_y:.1f}) {robot.state.name}"
+                            cv2.putText(result_img, state_info, (k_x1, k_y1 - 25), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                             
+                        if is_enemy or is_my_7:
+
                             if best_label != "NULL":
                                 carList_results.append([robot.id, car_id, [float(orig_cx), float(orig_cy), float(orig_w), float(orig_h)], 1, [0.0,0.0,0.0], field_xyz])
 
@@ -884,6 +978,12 @@ class CameraDetector(Node):
                     # tunning: 5. 遍历列表，将处于 GUESSING 状态的推演坐标也压入发布队列
                     for robot in active_robots:
                         if robot.state == TrackingState.GUESSING:
+                            
+                            # // tunning: 增加空值拦截。
+                            # 若 guess_pts 判定当前推演轨迹存在空间冲突或超时，其坐标将被置为 None，需同步跳过发布。
+                            if robot.field_x is None or robot.field_y is None:
+                                continue
+
                             # // tunning: ★ 核心过滤 - 如果是己方机器人（包括 7 号），钻进掩体就消失，不许发布紫色盲猜坐标
                             if not getattr(robot, 'is_enemy', False):
                                 continue

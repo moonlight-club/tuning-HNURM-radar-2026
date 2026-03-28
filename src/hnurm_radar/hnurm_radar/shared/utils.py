@@ -76,3 +76,47 @@ def xyxy2xywh(bbox: List[float | int]) -> List[float]:
     width = x2 - x1
     height = y2 - y1
     return [center_x, center_y, width, height]
+
+def nms_xywh(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.6) -> list:
+    """
+    非极大值抑制 (Non-Maximum Suppression)
+    用于过滤目标检测中冗余的重叠边界框。
+    
+    参数:
+        boxes (np.ndarray): 边界框数组，形状为 (N, 4)，格式为 [cx, cy, w, h]。
+        scores (np.ndarray): 置信度分数数组，形状为 (N,)。
+        iou_threshold (float): 交并比 (IoU) 阈值。高于此阈值的重叠框将被抑制。默认值为 0.6。
+        
+    返回:
+        list: 保留下的边界框索引列表。
+    """
+    if len(boxes) == 0:
+        return []
+
+    # 获取按置信度降序排列的索引列表
+    order = scores.argsort()[::-1].tolist()
+    keep = []
+
+    while len(order) > 0:
+        # 提取当前置信度最高的边界框索引
+        i = order.pop(0)
+        keep.append(i)
+
+        # 将中心点宽高格式 (cx, cy, w, h) 转换为角点格式 (x1, y1, x2, y2) 以便计算 IoU
+        box_i_xyxy = xywh2xyxy(boxes[i].tolist())
+
+        rest_order = []
+        for j in order:
+            box_j_xyxy = xywh2xyxy(boxes[j].tolist())
+            
+            # 计算当前最高分框与剩余框的 IoU
+            iou = compute_iou(box_i_xyxy, box_j_xyxy)
+            
+            # 仅保留 IoU 小于等于阈值的边界框索引
+            if iou <= iou_threshold:
+                rest_order.append(j)
+                
+        # 更新待处理的索引列表
+        order = rest_order
+
+    return keep

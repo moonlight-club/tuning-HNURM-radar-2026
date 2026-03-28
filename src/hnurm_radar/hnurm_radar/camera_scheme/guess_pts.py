@@ -36,17 +36,41 @@ class PointGuesser:
         self.x_limit = (0.0, 28.0)
         self.y_limit = (0.0, 15.0)
 
-     # --- [修改后] ---
     # // tunning: 接收主循环传来的动态真实时间差 dt
     def update(self, active_robots: list, dt: float = 0.033):
+        """
+        执行一帧物理推演，并引入空间竞争排他机制。
+        """
+        # 提取当前所有视觉锁定的真实机器人坐标
+        tracking_positions = [
+            (r.field_x, r.field_y) for r in active_robots 
+            if r.state == TrackingState.TRACKING and r.field_x is not None
+        ]
+
         for robot in active_robots:
             if robot.state == TrackingState.GUESSING:
                 if robot.field_x is None or robot.field_y is None:
+                    # // tunning: 超过最大盲猜时长，强行抹除坐标信息
+                    robot.field_x, robot.field_y = None, None
                     continue
 
                 # // tunning: 使用实际动态时间步长计算丢失时间，更加严谨
                 lost_duration = robot.miss_cnt * dt
                 if lost_duration > self.max_guess_sec:
+                    continue
+
+                # 2. // tunning: 幽灵劫持抑制逻辑 (Ghost Suppression)
+              # 若推演坐标与任一视觉追踪目标的距离小于 0.3m，则判定该推演轨迹冗余，停止输出。
+                is_conflicted = False
+                for tx, ty in tracking_positions:
+                    dist = np.hypot(robot.field_x - tx, robot.field_y - ty)
+                    if dist < 0.3: 
+                        is_conflicted = True
+                        break
+                
+                if is_conflicted:
+                    # 判定为身份劫持，立即终止该预测轨迹
+                    robot.field_x, robot.field_y = None, None
                     continue
 
                 if hasattr(robot, 'field_vx') and hasattr(robot, 'field_vy'):

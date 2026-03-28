@@ -88,4 +88,5 @@ class RobotState:
     last_seen_time: float = 0.0 # 上次真实观测的绝对时间戳
     
     # 兵种身份投票池: {label_name: count}
-    vote_pool: Dict[str, int] = field(default_factory=dict)
+    # // tunning: 将 count (int) 升级为 score (float)，以支持基于检测置信度的加权投票。
+    vote_pool: Dict[str, float] = field(default_factory=dict)

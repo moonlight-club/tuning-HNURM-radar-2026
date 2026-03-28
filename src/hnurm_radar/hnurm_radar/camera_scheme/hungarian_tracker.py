@@ -26,19 +26,23 @@ class HungarianTracker:
     严格只处理图像平面的 2D 追踪与关联。
     """
 # // tunning: 增加 lost_thr 和 guess_thr 参数，分别控制浅层丢失和深度丢失的状态转换阈值
-    def __init__(self, iou_thr=0.05, dist_thr=200, max_miss=90, lost_thr=3, guess_thr=15):
+# // tunning: 新增 label_penalty(身份冲突惩罚) 和 vote_decay(选票时间衰减率)
+    # [debug]适当调高vote_delay，降低遗忘速率
+    def __init__(self, iou_thr=0.05, dist_thr=200, max_miss=90, lost_thr=3, guess_thr=15, 
+                 label_penalty=1000.0, vote_decay=0.97):
+        
+        self.label_penalty = float(label_penalty) # // tunning: 发生分类冲突时的巨大代价惩罚
+        self.vote_decay = float(vote_decay)       # // tunning: 每帧历史选票的衰减系数，用于遗忘旧状态
         self.tracks = []  # 存活轨迹列表 list[RobotState]
         self.kf = BBoxKalmanFilter()  # 无状态卡尔曼推演工具
         self.next_id = 1
         self.iou_thr = float(iou_thr)
         self.dist_thr = float(dist_thr)
         
-        self.max_miss = int(max_miss)
+        self.max_miss = int(max_miss)   # 引入卡尔曼后，容忍丢失的帧数可以适当调大
         self.lost_thr = int(lost_thr)   # // tunning: 浅层丢失阈值
         self.guess_thr = int(guess_thr) # // tunning: 深度丢失盲猜阈值
-        
-        # 引入卡尔曼后，容忍丢失的帧数可以适当调大
-        self.max_miss = int(max_miss) 
+         
 
     def _cost_matrix(self, tracks, dets):
         """
@@ -52,26 +56,55 @@ class HungarianTracker:
             
         cost = np.full((M, N), 1e6, dtype=np.float32)
         
+        # 匹配得分权重参数
+        W_id = 5.0    # 身份一致性权重
+        W_iou = 1.0   # 边界框交并比 (IoU) 权重
+        W_dist = 0.4  # 归一化中心距离权重
+
         for i, tr in enumerate(tracks):
             # 提取卡尔曼滤波器【预测】的先验状态 [cx, cy, w, h]
             tcx, tcy, tw, th = tr.bbox_kf_state[:4]
             # 调用 utils 工具箱进行坐标系转换
             tr_xyxy = xywh2xyxy([tcx, tcy, tw, th])
             
+            # 提取轨迹历史最高票标签作为代表身份
+            best_label = max(tr.vote_pool, key=tr.vote_pool.get) if tr.vote_pool else "NULL"
+
             for j, d in enumerate(dets):
                 dcx, dcy = d.xywh[0], d.xywh[1]
                 # 调用 utils 工具箱计算 IoU
                 iou = compute_iou(tr_xyxy, d.xyxy)
-                dist = np.hypot(dcx - tcx, dcy - tcy) # 计算中心点距离
+
+                # // tunning: 引入归一化中心距离 ，目标点很远的时候采用欧式距离，其余使用iou距离
+                # 消除目标尺度对距离代价的影响，提升远距离小目标的匹配鲁棒性
+                dist = np.hypot(dcx - tcx, dcy - tcy)       # 绝对像素距离
+                diag = np.hypot(tw, th)                     # 预测框对角线长度
+                norm_dist = dist / (diag + 1e-5)            # 归一化距离 (加极小值防除零)
                 
-                # 门控逻辑：若 iou 很小且距离很大，保持高成本（拒绝匹配），防止误匹配
-                if iou < self.iou_thr and dist > self.dist_thr:
+                # 空间门控过滤：距离差异过大且 IoU 低于设定阈值时，拒绝匹配
+                if iou < self.iou_thr and norm_dist > 2.0:
                     continue
                     
-                # cost: 优先 IoU（负），距离次要
-                # tunning: ★ 修复分身问题。适当提高距离惩罚权重，
-                # 防止由于高动态导致预测框偏离时，匈牙利算法强行开新 ID。
-                cost[i, j] = -iou + 0.005 * dist
+                # 1. 计算基础几何得分
+                geom_score = (iou * W_iou) + (max(0, 1.0 - norm_dist) * W_dist)
+
+                # 2. 计算身份一致性得分与排他性惩罚
+                id_score = 0.0
+                if best_label != "NULL" and d.label != "NULL":
+                    if best_label == d.label:
+                        id_score = 1.0  # 类别标签一致
+                    else:
+                        # 身份互斥冲突：直接施加设定的极大惩罚代价，跳过后续得分转换
+                        cost[i, j] = self.label_penalty
+                        continue
+                elif best_label == "NULL" or d.label == "NULL":
+                    # 存在未知标签 (NULL) 时，提供基础正向得分，协助状态机平滑过渡
+                    id_score = 0.2
+
+                # 3. 计算最终匹配代价 (取累加得分的相反数)
+                total_score = geom_score + (id_score * W_id)
+                cost[i, j] = -total_score
+                
                 
         return cost
 
@@ -82,13 +115,41 @@ class HungarianTracker:
         返回: list[RobotState] 当前所有的存活机器人状态
         """
         # ==========================================
+        # 0. 数据清洗 (Data Sanitization)
+        # 拦截并过滤输入流中的 NULL 观测数据，确保下游张量运算合法性
+        # ==========================================
+        valid_detections = []
+        if detections:
+            for det in detections:
+                if det is None:
+                    continue
+                # 校验核心空间属性是否完整
+                if getattr(det, 'xywh', None) is None or getattr(det, 'xyxy', None) is None:
+                    continue
+                valid_detections.append(det)
+        # 覆写原始输入，切断脏数据传播路径
+        detections = valid_detections
+
+        # ==========================================
         # 1. 预测步 (Predict)
         # 强制所有存活轨迹利用运动学惯性向前推演一帧
         # ==========================================
         for tr in self.tracks:
-            # // tunning: 只要丢失视野，立刻冻结像素层速度，防止预测框飘到别的机器人身上导致 ID 错误
-            if tr.miss_cnt > 0:
-                tr.bbox_kf_state[4:] = 0.0
+
+            # tunning: ★ 引入身份投票池时间衰减机制
+            # 每经过一帧，将所有历史选票乘以 vote_decay，实现平滑遗忘,使得错误观测的影响逐渐减弱，允许轨迹在短暂丢失后恢复正确身份。
+            # tunning: 仅当目标处于视野内 (miss_cnt == 0) 时执行身份衰减。
+            # 目标被遮挡期间必须冻结历史身份，防止盲猜推演因失去 ID 而中断。
+            if tr.miss_cnt == 0:
+                for label_key in list(tr.vote_pool.keys()):
+                    tr.vote_pool[label_key] *= self.vote_decay
+                    # // tunning: 清理低于阈值的“死票”，防止字典无限膨胀
+                    if tr.vote_pool[label_key] < 0.1:
+                        del tr.vote_pool[label_key]
+
+            # # // tunning: 只要丢失视野，立刻冻结像素层速度，防止预测框飘到别的机器人身上导致 ID 错误
+            # if tr.miss_cnt > 0:
+            #     tr.bbox_kf_state[4:] = 0.0
             tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.predict(tr.bbox_kf_state, tr.bbox_kf_cov)
 
         # ==========================================
@@ -123,15 +184,39 @@ class HungarianTracker:
             z = np.array(det.xywh)
             tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z)
             
-            # 身份投票更新 (为后续抗误检做铺垫)
-            tr.vote_pool[det.label] = tr.vote_pool.get(det.label, 0) + 1
-            
+            # tunning: 身份惯性投票逻辑 (EMA优化版)
+            # 核心目的：在单帧漏检数字时，利用物理框的连续性维持之前的兵种身份，且防止 NULL 稀释权重
+            if det.label != "NULL":
+                # 情况 A：当前帧清晰地识别到了数字，正常进行权重累加
+                tr.vote_pool[det.label] = tr.vote_pool.get(det.label, 0.0) + det.conf
+            else:
+                # 情况 B：当前帧只看到了车身 (NULL)，启动惯性维持机制
+                if len(tr.vote_pool) > 0:
+                    # 获取池中除了 "NULL" 以外的所有真实兵种标签 (如 'B1', 'R3' 等)
+                    real_labels = [k for k in tr.vote_pool.keys() if k != "NULL"]
+                    
+                    if len(real_labels) > 0:
+                        # ★ 核心修正点：只把惯性权重分配给“真实身份”
+                        # 这样即使当前检测是 NULL，B3 或 R1 的权重依然会小幅增长，从而压制住 NULL
+                        inertia_weight = (det.conf * 0.1) / len(real_labels)
+                        for k in real_labels:
+                            tr.vote_pool[k] += inertia_weight
+                    else:
+                        # 如果池子里目前全是 NULL（说明该目标自出现起就从未被认出过数字）
+                        # 则只能给 NULL 加权，作为临时的身份占位
+                        tr.vote_pool["NULL"] = tr.vote_pool.get("NULL", 0.0) + det.conf * 0.1
+
+
+
+
             # 状态机维护
             if tr.state in [TrackingState.LOST, TrackingState.GUESSING]:
                 tr.state = TrackingState.RE_ACQUIRED
             else:
                 tr.state = TrackingState.TRACKING
-                
+            
+            # --- ★ 修复点 2：新增独立物理命中计数器，每被 YOLO 看到一次就加 1，不受 0.05 的压榨 ---
+            tr.hit_cnt = getattr(tr, 'hit_cnt', 0) + 1  
             tr.miss_cnt = 0
             tr.last_seen_time = time.time()
 
@@ -147,6 +232,21 @@ class HungarianTracker:
                 # 漏检超过 guess_thr，进入长时遮挡，交由 guess_pts 进行赛场物理推演
                 tr.state = TrackingState.GUESSING
             elif tr.miss_cnt > self.lost_thr:
+                # [debug]闪现起飞拦截与调试信息！
+                # 只有在状态【刚刚】转为 LOST 的那一帧打印，防止刷屏
+                if tr.state != TrackingState.LOST:
+                    vx, vy = tr.bbox_kf_state[4], tr.bbox_kf_state[5]
+                    vw, vh = tr.bbox_kf_state[6], tr.bbox_kf_state[7]
+                    
+                    # 打印出起飞前的罪证！
+                    print(f"\n[DEBUG 预警] 机器人 ID:{tr.id} 丢失视野！")
+                    print(f"  -> 消失前坐标: cx={tr.bbox_kf_state[0]:.1f}, cy={tr.bbox_kf_state[1]:.1f}")
+                    print(f"  -> 继承的瞬时速度: vx={vx:.1f}, vy={vy:.1f} | 缩放速度: vw={vw:.1f}, vh={vh:.1f}")
+                    
+                    # 可选：如果你发现真的是速度太离谱导致闪现，可以在这里强行刹车
+                    # if abs(vx) > 20 or abs(vy) > 20:
+                    #     print("  -> 速度异常偏大，已触发强制刹车！")
+                    #     tr.bbox_kf_state[4:] = 0.0
                 # 漏检超过 lost_thr 但未超过 guess_thr，依靠 bbox_kalman 在像素层滑行防闪烁
                 tr.state = TrackingState.LOST
 
@@ -160,9 +260,13 @@ class HungarianTracker:
             
             # 实例化新的 RobotState 容器
             new_tr = RobotState(id=new_id)
-            new_tr.vote_pool[det.label] = 1
+            # // tunning: 初始投票权重必须使用检测结果的真实置信度，防止 NULL 获得满额权重
+            new_tr.vote_pool[det.label] = det.conf
             new_tr.last_seen_time = time.time()
             
+            # --- ★ 修复点 3：初始化物理命中次数 ---
+            new_tr.hit_cnt = 1
+
             # 初始化卡尔曼状态与协方差矩阵
             z = np.array(det.xywh)
             new_tr.bbox_kf_state, new_tr.bbox_kf_cov = self.kf.initiate(z)
@@ -185,7 +289,45 @@ class HungarianTracker:
             if tr.miss_cnt <= allowed_max_miss:
                 surviving_tracks.append(tr)
                 
-        self.tracks = surviving_tracks       
+        self.tracks = surviving_tracks 
+        
+        # ==========================================
+        # 7. 全局 ID 唯一性抑制 (Global ID NMS)
+        # 拦截并销毁抢夺真实 ID 选票的长期丢失轨迹，解决分身劫持异常
+        # ==========================================
+        label_to_track = {}
+        for tr in self.tracks:
+            best_label = max(tr.vote_pool, key=tr.vote_pool.get) if tr.vote_pool else "NULL"
+            if best_label == "NULL":
+                continue
+                
+            if best_label not in label_to_track:
+                label_to_track[best_label] = tr
+            else:
+                # 发生身份冲突：两个轨迹均声称拥有同一高置信度标签
+                existing_tr = label_to_track[best_label]
+                existing_hits = sum(existing_tr.vote_pool.values())
+                current_hits = sum(tr.vote_pool.values())
+                
+                # 仲裁逻辑 1: 优先保留当前正处于视觉锁定状态 (TRACKING) 的轨迹
+                if existing_tr.state == TrackingState.TRACKING and tr.state != TrackingState.TRACKING:
+                    winner, loser = existing_tr, tr
+                elif tr.state == TrackingState.TRACKING and existing_tr.state != TrackingState.TRACKING:
+                    winner, loser = tr, existing_tr
+                else:
+                    # 仲裁逻辑 2: 若状态层级一致，依据历史累计命中票数判定真伪
+                    if current_hits > existing_hits:
+                        winner, loser = tr, existing_tr
+                    else:
+                        winner, loser = existing_tr, tr
+                        
+                # 惩罚执行: 强行剥夺伪轨迹/失效轨迹的争议身份选票
+                if best_label in loser.vote_pool:
+                    loser.vote_pool[best_label] = 0.0
+                
+                # 更新字典映射为胜出者
+                label_to_track[best_label] = winner     
+                
         return self.tracks
 
     def get_active_tracks(self):
