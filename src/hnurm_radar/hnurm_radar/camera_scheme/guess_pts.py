@@ -20,7 +20,7 @@ import numpy as np
 from hnurm_radar.shared.type import RobotState, TrackingState
 
 class PointGuesser:
-    def __init__(self, decay_factor: float = 0.96, max_guess_sec: float = 3.0):
+    def __init__(self, decay_factor: float = 0.94, max_guess_sec: float = 1.3, max_speed: float = 6.0):
         """
         初始化推演器。
         参数:
@@ -29,6 +29,7 @@ class PointGuesser:
         """
         self.decay_factor = decay_factor
         self.max_guess_sec = max_guess_sec
+        self.max_speed = max_speed  # // tunning: 盲猜速度上限(m/s)，防止飞点
         self.fps = 30.0
         self.dt = 1.0 / self.fps
         
@@ -41,6 +42,9 @@ class PointGuesser:
         """
         执行一帧物理推演，并引入空间竞争排他机制。
         """
+        # // tunning: 限幅 dt，避免卡顿帧导致一次积分位移过大
+        dt = max(0.01, min(0.1, float(dt)))
+
         # 提取当前所有视觉锁定的真实机器人坐标
         tracking_positions = [
             (r.field_x, r.field_y) for r in active_robots 
@@ -57,6 +61,12 @@ class PointGuesser:
                 # // tunning: 使用实际动态时间步长计算丢失时间，更加严谨
                 lost_duration = robot.miss_cnt * dt
                 if lost_duration > self.max_guess_sec:
+                    # // tunning: 超时后停止发布并清空速度，防止“飞天残留”
+                    robot.field_x, robot.field_y = None, None
+                    if hasattr(robot, 'field_vx'):
+                        robot.field_vx = 0.0
+                    if hasattr(robot, 'field_vy'):
+                        robot.field_vy = 0.0
                     continue
 
                 # 2. // tunning: 幽灵劫持抑制逻辑 (Ghost Suppression)
@@ -71,6 +81,10 @@ class PointGuesser:
                 if is_conflicted:
                     # 判定为身份劫持，立即终止该预测轨迹
                     robot.field_x, robot.field_y = None, None
+                    if hasattr(robot, 'field_vx'):
+                        robot.field_vx = 0.0
+                    if hasattr(robot, 'field_vy'):
+                        robot.field_vy = 0.0
                     continue
 
                 if hasattr(robot, 'field_vx') and hasattr(robot, 'field_vy'):
@@ -78,9 +92,20 @@ class PointGuesser:
                     robot.field_vx *= self.decay_factor
                     robot.field_vy *= self.decay_factor
 
+                    # // tunning: 速度向量限幅，防止异常速度导致预测爆炸
+                    v_norm = np.hypot(robot.field_vx, robot.field_vy)
+                    if v_norm > self.max_speed and v_norm > 1e-6:
+                        scale = self.max_speed / v_norm
+                        robot.field_vx *= scale
+                        robot.field_vy *= scale
+
                     # // tunning: 严格依据真实物理时间步 dt 执行积分位移
                     robot.field_x += robot.field_vx * dt
                     robot.field_y += robot.field_vy * dt
+                else:
+                    # // tunning: 无有效速度时不推演，避免随机漂移
+                    robot.field_x, robot.field_y = None, None
+                    continue
 
                 robot.field_x = max(0.1, min(self.x_limit[1] - 0.1, robot.field_x))
                 robot.field_y = max(0.1, min(self.y_limit[1] - 0.1, robot.field_y))

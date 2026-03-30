@@ -107,17 +107,8 @@ class CameraDetector(Node):
         self.class_num = len(self.labels)
 
 
-         # --- [修改后新增] ---
-        # // tunning: 注释掉前端冗余的追踪器投票表，彻底切断双大脑的记忆结构
+        # // tunning: 彻底移除前端冗余的追踪器投票表，统一使用后端 HungarianTracker 维护状态
         self.loop_times = 0
-
-        # # 追踪器投票表
-        # self.Track_value = {}
-        # self.Status = [0] * 10000
-        # for i in range(10000):
-        #     self.Track_value[i] = [0] * self.class_num
-        # self.id_candidate = [0] * 10000
-        # self.loop_times = 0
 
         # 灰色装甲板映射（与 detector_node 一致）
         self.Gray2Blue = {12: 5, 13: 1, 14: 0, 15: 3, 16: 2, 17: 4}
@@ -194,21 +185,6 @@ class CameraDetector(Node):
         self._load_or_calibrate_homography()
         self._load_mask()
 
-       # ---------- 坐标卡尔曼滤波器 ----------
-        # 修改：注释kalman_filter 开始
-        # filter_cfg = self.det_cfg.get('filter', {})
-        # self.kf_wrapper = KalmanFilterWrapper(
-        #     process_noise=float(filter_cfg.get('process_noise', 1e-2)),
-        #     measurement_noise=float(filter_cfg.get('measurement_noise', 1e-1)),
-        #     jump_threshold=float(filter_cfg.get('jump_threshold', 1.0)),
-        #     max_velocity=float(filter_cfg.get('max_velocity', 5.0)),
-        #     max_inactive_time=float(filter_cfg.get('max_inactive_time', 3.0)),
-        # )
-        # self._cleanup_counter = 0
-        # 修改：注释kalman_filter 结束
-
-        
-
         # ---------- 小地图 ----------
         self.map_img = cv2.imread(MAP_IMAGE_PATH)
         if self.map_img is None:
@@ -227,12 +203,12 @@ class CameraDetector(Node):
         # // tunning: 从 config 读取完整的三段式生命周期参数
         self.hungarian = HungarianTracker(
             iou_thr=float(track_params.get('iou_thr', 0.05)),
-            dist_thr=float(track_params.get('dist_thr', 200)),
-            max_miss=int(track_params.get('max_miss', 84)),    # // tunning: 最大容忍 84 帧 (2.8s)
+            dist_thr=float(track_params.get('dist_thr', 120)),
+            max_miss=int(track_params.get('max_miss', 54)),    # // tunning: 最大容忍 54 帧 (1.3s)
             # // tunning: 提升浅层丢失阈值至 3，允许 YOLO 连续漏检 3 帧而不改变 TRACKING 状态，消除高频震荡
             lost_thr=int(track_params.get('lost_thr', 3)),     
             # // tunning: 扩大盲猜介入阈值，拉开 LOST 与 GUESSING 的层级差距
-            guess_thr=int(track_params.get('guess_thr', 15))
+            guess_thr=int(track_params.get('guess_thr', 18))
         )
         # tunning: 当无检测时是否发布短期预测/历史位置信息（YAML 可配置）
         self.publish_predict_when_no_det = bool(self.det_cfg.get('publish_predict_when_no_det', True))
@@ -240,7 +216,8 @@ class CameraDetector(Node):
        # // tunning: 从参数文件读取盲猜配置，保持逻辑与参数绝对统一
         self.guesser = PointGuesser(
             decay_factor=float(track_params.get('decay_factor', 0.94)),
-            max_guess_sec=float(track_params.get('max_guess_sec', 2.8))
+            max_guess_sec=float(track_params.get('max_guess_sec', 1.3)),
+            max_speed=float(track_params.get('max_speed', 6.0))
         )
         self.get_logger().info("CameraDetector 初始化完成。")
 
@@ -497,19 +474,7 @@ class CameraDetector(Node):
         重置跟踪器和滤波器状态。
         在视频循环播放时调用，避免状态残留导致坐标错误。
         """
-        # 修改：注释kalman_filter 开始
-        # // tunning: 注释掉对废弃的 Track_value 和 Status 的重置
-     # for i in range(10000):
-     #     self.Track_value[i] = [0] * self.class_num
-     #     self.Status[i] = 0
-     # self.id_candidate = [0] * 10000
-
-        # // tunning: 注释掉对 YOLO 内部 ByteTrack 追踪器的重置
-        # if hasattr(self.model_car, 'predictor') and self.model_car.predictor is not None:
-        #     if hasattr(self.model_car.predictor, 'trackers'):
-        #         self.model_car.predictor.trackers = None
-
-        # // tunning: 新增对后端唯一trcker维护者 HungarianTracker 的重置逻辑
+        # // tunning: 重置后端唯一 tracker 维护者 HungarianTracker 的状态
         if hasattr(self, 'hungarian'):
             self.hungarian.tracks.clear()
             self.hungarian.next_id = 1
@@ -607,9 +572,6 @@ class CameraDetector(Node):
         if self._is_results_empty(results):
             return frame, None
 
-        # // tunning: 注释掉冗余的同帧判重数组
-        # exist_armor = [-1] * (self.class_num + 6)
-
         draw_candidate = []
         confidences, boxes, track_ids = self._parse_results(results)
         zip_results = []
@@ -657,62 +619,6 @@ class CameraDetector(Node):
             x, y, w, h = box
             # status = 0
 
-            # if classify_label != -1:
-            #     label = self.Track_value[int(track_id)].index(
-            #         max(self.Track_value[int(track_id)]))
-            #     if classify_label > 11:  # Gray
-            #         status = 1
-            #         if self.Status[track_id] < 6:
-            #             self.Status[track_id] += status
-            #         if label < 6 and self.Gray2Blue.get(classify_label) == label:
-            #             self.Track_value[int(track_id)][int(float(
-            #                 self.Gray2Blue[classify_label]))] += 0.5 + conf * 0.5
-            #         elif label > 5 and self.Gray2Red.get(classify_label) == label:
-            #             self.Track_value[int(track_id)][int(float(
-            #                 self.Gray2Red[classify_label]))] += 0.5 + conf * 0.5
-            #         else:
-            #             classify_label = -1
-            #     else:
-            #         if self.Status[int(track_id)] > 0:
-            #             self.Status[int(track_id)] -= 1
-            #         if self.Status[int(track_id)] < 4:
-            #             self.Status[int(track_id)] = 0
-            #         # 高置信度纠正：当前帧分类与投票结果不一致时，加大权重
-            #         vote_weight = 0.5 + conf * 0.5
-            #         if conf > 0.85 and label != int(float(classify_label)) and max(self.Track_value[int(track_id)]) > 0:
-            #             vote_weight = 2.0 + conf * 2.0  # 高置信度不一致时给 4 倍权重纠正
-            #         self.Track_value[int(track_id)][int(float(
-            #             classify_label))] += vote_weight
-
-            # label = self.Track_value[int(track_id)].index(
-            #     max(self.Track_value[int(track_id)]))
-
-            # # 判重
-            # if label < len(exist_armor) and exist_armor[label] != -1:
-            #     old_id = exist_armor[label]
-            #     if self.Track_value[int(track_id)][label] < self.Track_value[int(old_id)][label]:
-            #         self.Track_value[int(track_id)][label] = 0
-            #         label = "NULL"
-            #     else:
-            #         self.Track_value[int(old_id)][label] = 0
-            #         old_id_index = self.id_candidate[old_id]
-            #         if old_id_index < len(draw_candidate):
-            #             draw_candidate[old_id_index][5] = "NULL"
-            #         exist_armor[label] = track_id
-            # else:
-            #     if label < len(exist_armor):
-            #         exist_armor[label] = track_id
-
-            # pd = self.Track_value[int(track_id)][0]
-            # same = True
-            # for j in range(self.class_num - 1):
-            #     if pd != self.Track_value[int(track_id)][j + 1]:
-            #         same = False
-            #         break
-            # if not same and label != "NULL":
-            #     label = str(self.labels[label])
-            # else:
-            #     label = "NULL"
 
             # // tunning: 新增纯净的瞬时观测输出逻辑，直接将当前帧分类结果转为字符串 label
             if classify_label != -1 and classify_label < len(self.labels):
@@ -844,7 +750,8 @@ class CameraDetector(Node):
                     # tunning: 2. 匈牙利核心推演 (卡尔曼平滑 + ID关联)
                     # ==========================================
                     # tunning: 无论当前帧有无 YOLO 检测，都必须调用 update 推动卡尔曼滤波器向前推演
-                    active_robots = self.hungarian.update(detections)
+                    # // tunning: 传递真实物理时间步长 dt，确保卡尔曼预测位移准确
+                    active_robots = self.hungarian.update(detections, dt)
 
                     # ==========================================
                     # tunning: 3. 坐标投影与下发：仅使用平滑后的卡尔曼预测框
@@ -852,10 +759,6 @@ class CameraDetector(Node):
                     # // tunning: 新增防分身集合，记录本帧已经露头的真实车辆
                     published_car_ids = set()
                     for robot in active_robots:
-                        # tunning: 如果目标已经深度丢失（丢失帧数超过阈值） (进入掩体吸附状态)，由下游的 point_guesser 节点接管，相机节点停止发布
-                        if robot.state == TrackingState.GUESSING:
-                            continue
-                            
                         # tunning: 身份投票决议：取出历史投票中最多的 label 作为最终身份
                         best_label = max(robot.vote_pool, key=robot.vote_pool.get) if robot.vote_pool else "NULL"
                         
@@ -871,10 +774,50 @@ class CameraDetector(Node):
                                    (self.my_color == "Blue" and car_id < 100 and car_id != -1)
                         robot.is_enemy = is_enemy # 标记身份，给后面的 guesser 用
 
+                        is_my_7 = (self.my_color == "Red" and car_id == 7) or \
+                                  (self.my_color == "Blue" and car_id == 107)
+
+                        # =================【修改 1：先把框画出来】=================
+                        kf_cx, kf_cy, kf_w, kf_h = robot.bbox_kf_state[:4]
+                        k_x1, k_y1 = int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0)
+                        k_x2, k_y2 = int(kf_cx + kf_w / 2.0), int(kf_cy + kf_h / 2.0)
+
+                        if kf_w > 2.0 and kf_h > 2.0:
+                            should_draw = False
+                            box_color = (0, 0, 0)
+
+                            if (is_enemy or is_my_7) and robot.state != TrackingState.GUESSING:
+                                should_draw = True
+                                if robot.state == TrackingState.TRACKING:
+                                    box_color = (0, 255, 255) if is_enemy else (255, 0, 0)
+                                elif robot.state == TrackingState.LOST:
+                                    box_color = (255, 0, 255)
+                                # tunning: 注释掉 GUESSING 画框逻辑（不再绘制灰色盲猜框）
+                            elif robot.state == TrackingState.TRACKING:
+                                should_draw = True
+                                box_color = (255, 50, 0)
+
+                            if should_draw:
+                                cv2.rectangle(result_img, (k_x1, k_y1), (k_x2, k_y2), box_color, 2)
+                                display_label = best_label if best_label != "NULL" else f"NULL-{robot.id}"
+                                cv2.putText(result_img, display_label, (k_x1, k_y1 - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                                disp_fx = robot.field_x if robot.field_x is not None else 0.0
+                                disp_fy = robot.field_y if robot.field_y is not None else 0.0
+                                state_info = f"({disp_fx:.1f},{disp_fy:.1f}) {robot.state.name}"
+                                cv2.putText(result_img, state_info, (k_x1, k_y1 - 25),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                        # ==========================================================
+
+                        # =================【修改 2：拦截 GUESSING 重投影】=================
+                        if robot.state == TrackingState.GUESSING:
+                            continue
+                        # ================================================================
+
                         # ==========================================
                         # 核心坐标计算逻辑 (保持原封不动，确保 field_x 不为 None)
                         # ==========================================
-                        kf_cx, kf_cy, kf_w, kf_h = robot.bbox_kf_state[:4]
                         orig_cx = kf_cx * ORIG_W / INFER_W
                         orig_cy = kf_cy * ORIG_H / INFER_H
                         orig_h = kf_h * ORIG_H / INFER_H
@@ -891,11 +834,6 @@ class CameraDetector(Node):
                         field_x = max(0.0, min(28.0, field_x))
                         field_y = max(0.0, min(15.0, field_y))
 
-                        # 修改：注释kalman_filter 开始
-                        # field_x, field_y = self.kf_wrapper.update(car_id, field_x, field_y)
-                        # field_x = max(0.0, min(28.0, field_x))
-                        # field_y = max(0.0, min(15.0, field_y))
-
                         field_xyz = np.array([field_x, field_y, 0.0])
 
                         if robot.state == TrackingState.TRACKING and robot.field_x is not None:
@@ -907,51 +845,7 @@ class CameraDetector(Node):
                                 robot.field_vy = 0.5 * getattr(robot, 'field_vy', 0.0) + 0.5 * raw_vy
                         
                         robot.field_x, robot.field_y = field_x, field_y
-
                         # // tunning: ★ 发布门控 - 只有敌人或己方7号/107号才发布坐标
-                        is_my_7 = (self.my_color == "Red" and car_id == 7) or \
-                                  (self.my_color == "Blue" and car_id == 107)
-                        
-                        # ==========================================
-                        # ★ 仅修改此处：分阵营、分状态画图
-                        # ==========================================
-                        k_x1, k_y1 = int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0)
-                        k_x2, k_y2 = int(kf_cx + kf_w / 2.0), int(kf_cy + kf_h / 2.0)
-
-                        should_draw = False
-                        box_color = (0, 0, 0)
-
-                        if kf_w <= 2.0 or kf_h <= 2.0:
-                            # 如果宽或高已经预测成负数或小到看不见，说明已经缩到极点，跳过画图
-                            continue
-                        
-                        if is_enemy:
-                            # 敌方：Tracking 黄色 (0, 255, 255)，Lost 洋红色 (255, 0, 255)
-                            should_draw = True
-                            box_color = (0, 255, 255) if robot.state == TrackingState.TRACKING else (255, 0, 255)
-                        elif is_my_7:
-                            # 己方 7 号：Tracking 蓝色 (255, 0, 0)，Lost 洋红色 (255, 0, 255)
-                            should_draw = True
-                            box_color = (255, 0, 0) if robot.state == TrackingState.TRACKING else (255, 0, 255)
-                        else:
-                            # 普通己方 (1-6)：仅在 Tracking 时画蓝色 (255, 0, 0)，Lost 时消失
-                            if robot.state == TrackingState.TRACKING:
-                                should_draw = True
-                                box_color = (255, 0, 0)
-
-                        if should_draw:
-                            # 1. 绘制矩形框
-                            cv2.rectangle(result_img, (k_x1, k_y1), (k_x2, k_y2), box_color, 2)
-
-                            # 2. 绘制 ID 标签 (原 ID 位置)
-                            display_label = best_label if best_label != "NULL" else f"NULL-{robot.id}"
-                            cv2.putText(result_img, display_label, (k_x1, k_y1 - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-                            # 3. 绘制坐标与状态 (上方小字)
-                            state_info = f"({field_x:.1f},{field_y:.1f}) {robot.state.name}"
-                            cv2.putText(result_img, state_info, (k_x1, k_y1 - 25), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                             
                         if is_enemy or is_my_7:
 
@@ -966,47 +860,9 @@ class CameraDetector(Node):
                             allLocation.locs.append(loc)
 
 
-                    # ==========================================
-                    # tunning: 4. guess_pts.py 接管深度丢失目标，执行带衰减的惯性外推
-                    # ==========================================
-                    # 此处放在循环外，确保所有可见机器人的 field_vx/vy 已更新完毕
-                    # // tunning: ★ 只有敌方机器人才传给 guesser，己方不参与预测
-                    enemies = [r for r in active_robots if getattr(r, 'is_enemy', False)]
-                    # // tunning: 将动态物理时间步 dt 传递给推演器
-                    self.guesser.update(enemies, dt) 
-
-                    # tunning: 5. 遍历列表，将处于 GUESSING 状态的推演坐标也压入发布队列
-                    for robot in active_robots:
-                        if robot.state == TrackingState.GUESSING:
-                            
-                            # // tunning: 增加空值拦截。
-                            # 若 guess_pts 判定当前推演轨迹存在空间冲突或超时，其坐标将被置为 None，需同步跳过发布。
-                            if robot.field_x is None or robot.field_y is None:
-                                continue
-
-                            # // tunning: ★ 核心过滤 - 如果是己方机器人（包括 7 号），钻进掩体就消失，不许发布紫色盲猜坐标
-                            if not getattr(robot, 'is_enemy', False):
-                                continue
-                            # 身份逻辑：盲猜期间沿用最后一次确定的身份
-                            best_label = max(robot.vote_pool, key=robot.vote_pool.get) if robot.vote_pool else "NULL"
-                            car_id = self.carList.get_car_id(best_label) if best_label != "NULL" else (9000 + robot.id)
-                            
-                            # // tunning: ★防分身拦截核心！如果该 ID 的真身已被观测到，或身份无效，立刻停止发布它的盲猜幽灵
-                            if car_id in published_car_ids or car_id == -1:
-                                continue
-                                
-                            # 3秒门控由 guess_pts.py 内部控制，此处直接打包
-                            loc = Location()
-                            loc.x = float(robot.field_x)
-                            loc.y = float(robot.field_y)
-                            loc.z = -1.0 # // tunning: 悄悄把 z 设为 -1.0，作为给 display_panel 的“盲猜暗号”
-                            
-                            loc.id = int(car_id)
-                            loc.label = "Red" if loc.id < 100 else "Blue"
-                            allLocation.locs.append(loc)
 
                     # ==========================================
-                    # tunning : 更新 CarList 与 发布 (原有逻辑)
+                    # 4. 更新 CarList 与 发布 (原有逻辑)
                     # ==========================================
                     if carList_results:
                         self.carList.update_car_info(carList_results)
@@ -1014,11 +870,6 @@ class CameraDetector(Node):
                     # 此时 allLocation 已经包含了“观测点”和“盲猜点”
                     self.pub_location.publish(allLocation)
 
-                # 修改：注释kalman_filter 开始
-                # # ★ 定期清理超时的卡尔曼滤波器
-                # self._cleanup_counter += 1
-                # if self._cleanup_counter % 100 == 0:
-                #     self.kf_wrapper.cleanup()
 
                 # ---------- 在推理图像上显示 FPS ----------
                 cv2.putText(result_img, f"FPS: {fps:.1f}", (20, 40),
@@ -1064,12 +915,15 @@ class CameraDetector(Node):
             is_guessing = (z < 0.0)
 
             # // tunning: 机器人颜色不仅决定阵营，还决定是否为盲猜状态
+            # [debug] 发布盲猜点的坐标
+            # if is_guessing:
+            #     color = (200, 200, 200)  # 盲猜幽灵点统一为亮灰色 (BGR)
             if loc.label == 'Red':
                 # 红方：盲猜点画紫色 (BGR: 255, 0, 255)，正常画红色
                 color = (255, 0, 255) if is_guessing else (0, 0, 255)
             else:
                 # 蓝方：盲猜点画青蓝色 (BGR: 255, 255, 0)，正常画蓝色
-                color = (255, 255, 0) if is_guessing else (255, 100, 0) # tunning: 蓝色改为更亮的橙蓝色，增强视觉区分度
+                color = (255, 255, 0) if is_guessing else (250, 100, 0) # tunning: 蓝色改为更亮的橙蓝色，增强视觉区分度
 
             # 绘制圆圈和编号
             cv2.circle(show_map, (map_xx, map_yy), 60, color, 4)

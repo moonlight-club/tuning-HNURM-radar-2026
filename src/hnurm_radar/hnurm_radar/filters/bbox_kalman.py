@@ -36,7 +36,8 @@ class BBoxKalmanFilter(object):
 
             # // tunning: ★ 引入预测阻尼（摩擦力），防止预测框因异常速度“飞出去”
             # 对角线元素默认是 1 (v = v)。这里改为 0.95，意味着每推演一帧，像素速度会自动衰减 1%。这在保持预测方向的同时，强行截断了速度爆炸。
-            self.F_k[self.m + i, self.m + i] = 0.98
+            # [debug] 增加阻尼，防止LOST预测框飞出去
+            self.F_k[self.m + i, self.m + i] = 0.95
 
         # [debug]切断 vw (宽度变化率) 和 vh (高度变化率) 在预测步中对实际宽高的影响。
         # 这样在纯预测 (LOST/GUESSING) 期间，中心点(cx, cy)会按速度(vx, vy)正常滑行，
@@ -52,12 +53,38 @@ class BBoxKalmanFilter(object):
         # 单位矩阵I, 这里当数字1使用. P_k = (I - K_k*H_k)*P_k
         self.I = np.eye(self.n)
 
-        # 噪声权重参数 (针对雷达站实机画面微调)
-        self._std_weight_position = 1.0 / 20
-        self._std_weight_velocity = 1.0 / 160
-        # 3. tunning:压制尺度噪声 (改到 1/200)
-        # YOLO 的框经常忽大忽小，这会导致中心点抖动，锁死它的尺度变化率！
-        self._std_weight_scale = 1.0 / 200
+       # ==========================================
+        # // tunning: 独立配置过程噪声与观测噪声的基础权重
+        # ==========================================
+        # 1. 过程噪声基准权重 (Q): 极小化，赋予卡尔曼匀速物理模型极高的信任度
+        
+        # [debug2]放宽位置的过程噪声权重，尝试解决拐弯速度跟不上的问题
+        # ==========================================
+        # // tunning: 配合阻尼，释放敏捷跟踪能力！
+        # ==========================================
+        self._q_weight_pos = 1.0 / 4000      # 提高对位置突变的信任，解决拐弯跟不上
+        self._q_weight_vel = 1.0 / 400      # 放宽速度变化，有 0.85 的阻尼护航，绝对不会飞出！
+        self._q_weight_scale = 1.0 / 20000
+
+        # # [degug1] 尝试根据HIT经验值设置位置与速度的过程噪声权重，进一步强化对匀速假设的信任，同时允许尺度有更大的适应性，提升对远距离小目标的稳定性。
+        # # ==========================================
+        # # 1. 过程噪声基准权重 (Q): 严格限制绝对量级，防止速度状态发散
+        # self._q_weight_pos = 1.0 / 10000    # 中心点位置的过程噪声权重
+        # self._q_weight_vel = 1.0 / 1000     # 速度的过程噪声权重 (保持相对位置权重的大比值，但绝对值受限)
+        # self._q_weight_scale = 1.0 / 20000  # 尺度的过程噪声权重
+
+        # 2. 观测噪声基准权重 (R): 保持对观测值的适度信任，构建低通屏障
+        self._r_weight_pos = 1.0 / 100      # 中心点位置的观测噪声权重 (量级远大于Q)
+        self._r_weight_scale = 1.0 / 200    # 尺度的观测噪声权重
+        
+        # self._q_weight_pos = 1.0 / 200      # 中心点位置的过程噪声权重
+        # self._q_weight_vel = 1.0 / 1500     # 速度的过程噪声权重 (极小值，强制收敛静止抖动)
+        # self._q_weight_scale = 1.0 / 2000   # 尺度的过程噪声权重
+
+        # # 2. 观测噪声基准权重 (R): 设定为过程噪声的 10 倍，降低对 YOLO 原始高频抖动的信任度
+        # self._r_weight_pos = 1.0 / 35       # 中心点位置的观测噪声权重
+        # self._r_weight_scale = 1.0 / 200    # 尺度的观测噪声权重
+
 
     def _get_adaptive_sf(self, w, h):
         """
@@ -87,45 +114,49 @@ class BBoxKalmanFilter(object):
 
         # 初始协方差矩阵设定：给速度项分配极大的不确定性
         std = [
-            2 * self._std_weight_position * z[2]* sf,  # cx 噪声与宽度相关
-            2 * self._std_weight_position * z[3]* sf,  # cy 噪声与高度相关
-            2 * self._std_weight_scale * z[2]* sf,     # w 噪声
-            2 * self._std_weight_scale * z[3]* sf,     # h 噪声
-            10 * self._std_weight_velocity * z[2]* sf, # vx
-            10 * self._std_weight_velocity * z[3]* sf, # vy
-            10 * self._std_weight_velocity * z[2]* sf, # vw
-            10 * self._std_weight_velocity * z[3]* sf  # vh
+            2 * self._r_weight_pos * z[2] * sf,     # cx 初始噪声
+            2 * self._r_weight_pos * z[3] * sf,     # cy 初始噪声
+            2 * self._r_weight_scale * z[2] * sf,   # w 初始噪声
+            2 * self._r_weight_scale * z[3] * sf,   # h 初始噪声
+            10 * self._q_weight_vel * z[2] * sf,    # vx 初始分布
+            10 * self._q_weight_vel * z[3] * sf,    # vy 初始分布
+            10 * self._q_weight_vel * z[2] * sf,    # vw 初始分布
+            10 * self._q_weight_vel * z[3] * sf     # vh 初始分布
         ]
         # P_result: 最优P_k, 当前时刻最优估计协方差矩阵 (对角阵)
         P_result = np.diag(np.square(std))
         return x, P_result
 
-    def predict(self, x: np.ndarray, P_result: np.ndarray):
+    def predict(self, x: np.ndarray, P_result: np.ndarray, dt=0.033):
         """
         根据系统运动学方程，更新预测状态。
         参数:
             x: 前一时刻(k-1)状态向量
             P_result: 前一时刻最优估计协方差矩阵
+            dt: 真实时间步长
         返回:
             x_pred: 新时刻(k)的先验预测状态向量
             P_current: 新时刻的先验预测协方差矩阵
         """
+        # // tunning: 动态更新状态转移矩阵中的 dt 系数，确保位移量与真实时间步长对齐
+        self.F_k[0, 4] = dt
+        self.F_k[1, 5] = dt
 
         # // tunning: 依据当前预测框的宽高计算尺度因子
         sf = self._get_adaptive_sf(x[2], x[3])
 
         # Q_k: 各状态变量的预测噪声协方差矩阵 (动态计算)
         std_pos = [
-            self._std_weight_position * x[2] * sf,
-            self._std_weight_position * x[3] * sf,
-            self._std_weight_scale * x[2] * sf,
-            self._std_weight_scale * x[3] * sf
+            self._q_weight_pos * x[2] * sf,
+            self._q_weight_pos * x[3] * sf,
+            self._q_weight_scale * x[2] * sf,
+            self._q_weight_scale * x[3] * sf
         ]
         std_vel = [
-            self._std_weight_velocity * x[2] * sf,
-            self._std_weight_velocity * x[3] * sf,
-            self._std_weight_velocity * x[2] * sf,
-            self._std_weight_velocity * x[3] * sf
+           self._q_weight_vel * x[2] * sf,
+            self._q_weight_vel * x[3] * sf,
+            self._q_weight_vel * x[2] * sf,
+            self._q_weight_vel * x[3] * sf
         ]
         Q_k = np.diag(np.square(np.r_[std_pos, std_vel]))
 
@@ -153,10 +184,10 @@ class BBoxKalmanFilter(object):
 
         # R_k: 传感器测量噪声协方差矩阵 (动态计算)
         std = [
-            self._std_weight_position * z[2] * sf,
-            self._std_weight_position * z[3] * sf,
-            self._std_weight_scale * z[2] * sf,
-            self._std_weight_scale * z[3] * sf
+            self._r_weight_pos * z[2] * sf,
+            self._r_weight_pos * z[3] * sf,
+            self._r_weight_scale * z[2] * sf,
+            self._r_weight_scale * z[3] * sf
         ]
         R_k = np.diag(np.square(std))
 
@@ -180,11 +211,13 @@ class BBoxKalmanFilter(object):
         # 如果 YOLO 观测点和卡尔曼预测点中心距离超过 100 像素，直接判定预测失败
         # 强行重置位置并清空瞬时速度，防止预测框“起飞”
         dist = np.linalg.norm(x[:2] - z[:2])
-        if dist > 100:
+        if dist > 150:
             x_new[:4] = z
             x_new[4:] = 0.0
+            # [DEBUG]发生突变时，同步重置协方差矩阵 P，强行让卡尔曼“忘掉”历史误差惯性！
+            P_current = np.eye(self.n)
 
-        # // tunning: 底层状态硬钳制。限制像素速度 (vx, vy, vw, vh) 单帧最大变化量不超过 80 像素
+        # // tunning: 底层状态硬钳制。限制像素速度 (vx, vy, vw, vh) 单帧最大变化量不超过 50 像素
         x_new[4:] = np.clip(x_new[4:], -50, 50)
 
         # 最后,最优预测协方差矩阵

@@ -33,12 +33,12 @@ filter:
 # 匈牙利匹配tracker参数
 track:
   iou_thr: 0.05                # IoU 门控下限
-  dist_thr: 200                # 中心距离门控（像素）
+  dist_thr: 120                # 中心距离门控（像素）
   lost_thr: 3                  # 漏检1~3帧(0~0.1s)：防闪烁，维持像素短时预测并锁死物理速度
-  guess_thr: 15                # 漏检15帧：抛弃像素预测，立刻触发赛场物理坐标系惯性滑行
-  max_miss: 84                 # 漏检>84帧(>2.8s)：盲猜滑行至2.8s后彻底清除目标内存
-  decay_factor: 0.94           # // tunning: 盲猜速度衰减系数 (越小滑行距离越短)
-  max_guess_sec: 2.8           # // tunning: 盲猜最长持续时间 (秒)，应与 max_miss 对应
+  guess_thr: 18                # tunning: 进入 GUESSING 的阈值略上调，降低过早盲猜
+  max_miss: 54                 # 漏检>54帧(>1.8s)：盲猜滑行至1.8s后彻底清除目标内存
+  decay_factor: 0.94           # tunning: 增大速度衰减（更快减速，抑制飞点）
+  max_guess_sec: 1.3           # tunning: 盲猜最长持续时间下调到 1.3s
   publish_predict_when_no_det: true  # 无检测时是否发布预测/历史位置
   
 is_record: true

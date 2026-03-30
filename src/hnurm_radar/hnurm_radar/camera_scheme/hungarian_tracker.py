@@ -28,7 +28,7 @@ class HungarianTracker:
 # // tunning: 增加 lost_thr 和 guess_thr 参数，分别控制浅层丢失和深度丢失的状态转换阈值
 # // tunning: 新增 label_penalty(身份冲突惩罚) 和 vote_decay(选票时间衰减率)
     # [debug]适当调高vote_delay，降低遗忘速率
-    def __init__(self, iou_thr=0.05, dist_thr=200, max_miss=90, lost_thr=3, guess_thr=15, 
+    def __init__(self, iou_thr=0.05, dist_thr=120, max_miss=45, lost_thr=3, guess_thr=10, 
                  label_penalty=1000.0, vote_decay=0.97):
         
         self.label_penalty = float(label_penalty) # // tunning: 发生分类冲突时的巨大代价惩罚
@@ -59,7 +59,8 @@ class HungarianTracker:
         # 匹配得分权重参数
         W_id = 5.0    # 身份一致性权重
         W_iou = 1.0   # 边界框交并比 (IoU) 权重
-        W_dist = 0.4  # 归一化中心距离权重
+        # [debug]提高欧氏距离权重，强化空间门控的区分能力
+        W_dist = 2.5  # 归一化中心距离权重
 
         for i, tr in enumerate(tracks):
             # 提取卡尔曼滤波器【预测】的先验状态 [cx, cy, w, h]
@@ -82,7 +83,8 @@ class HungarianTracker:
                 norm_dist = dist / (diag + 1e-5)            # 归一化距离 (加极小值防除零)
                 
                 # 空间门控过滤：距离差异过大且 IoU 低于设定阈值时，拒绝匹配
-                if iou < self.iou_thr and norm_dist > 2.0:
+                # [debug]norm_dist增大，检查交错身份劫持是否有所缓解
+                if iou < self.iou_thr and norm_dist > 1.2:
                     continue
                     
                 # 1. 计算基础几何得分
@@ -108,10 +110,11 @@ class HungarianTracker:
                 
         return cost
 
-    def update(self, detections):
+    def update(self, detections, dt=0.033):
         """
         执行一帧的追踪与状态更新。
         detections: list[SingleDetectionResult]
+        dt: 真实时间步长
         返回: list[RobotState] 当前所有的存活机器人状态
         """
         # ==========================================
@@ -150,8 +153,8 @@ class HungarianTracker:
             # # // tunning: 只要丢失视野，立刻冻结像素层速度，防止预测框飘到别的机器人身上导致 ID 错误
             # if tr.miss_cnt > 0:
             #     tr.bbox_kf_state[4:] = 0.0
-            tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.predict(tr.bbox_kf_state, tr.bbox_kf_cov)
-
+            tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.predict(tr.bbox_kf_state, tr.bbox_kf_cov, dt)
+        
         # ==========================================
         # 2. 匹配步 (Associate)
         # ==========================================
@@ -282,7 +285,7 @@ class HungarianTracker:
             total_hits = sum(tr.vote_pool.values())
             
             # // tunning: 核心策略 —— 区分对待：
-            # 1. 如果是确认过的“真车”（命中>=5次），允许它在掩体后滑行 max_miss 帧 (2.8s)。
+            # 1. 如果是确认过的“真车”（命中>=5次），允许它在掩体后滑行 max_miss 帧 (1.5s)。
             # 2. 如果只是闪现的“噪音”（命中<5次），丢视野 3 帧立刻销毁，防止堆积导致卡顿！
             allowed_max_miss = self.max_miss if total_hits >= 5 else 3
             
