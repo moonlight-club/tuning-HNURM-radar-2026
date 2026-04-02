@@ -9,6 +9,8 @@ camera_detector.py — 纯相机透视变换雷达站检测节点
   - 不依赖 ICP / TF 重定位
   - 使用 4 组以上「图像像素 ↔ 赛场坐标」对应点计算单应性矩阵（Homography）
   - 检测到机器人后取包围框底部中心点，通过透视变换直接得到赛场 (x, y)
+
+
 """
 
 import rclpy
@@ -24,10 +26,10 @@ from ..Car.Car import CarList
 from ..camera_locator.anchor import Anchor
 from ..camera_locator.point_picker import PointsPicker
 from ..filters.kalman_filter import KalmanFilterWrapper
-from .hungarian_tracker import HungarianTracker  # tunning: 新增匈牙利关联模块导入
-from ..shared.type import SingleDetectionResult, TrackingState # tunning: 引入底层数据协议与状态机
+from .hungarian_tracker import HungarianTracker  # 新增匈牙利关联模块导入
+from ..shared.type import SingleDetectionResult, TrackingState # 引入底层数据协议与状态机
 from ..shared.utils import nms_xywh, compute_iou, xywh2xyxy
-from .guess_pts import PointGuesser  # tunning: 引入长时间丢失惯性推演
+from .guess_pts import PointGuesser  # 引入长时间丢失惯性推演
 
 import cv2
 import numpy as np
@@ -107,7 +109,7 @@ class CameraDetector(Node):
         self.class_num = len(self.labels)
 
 
-        # // tunning: 彻底移除前端冗余的追踪器投票表，统一使用后端 HungarianTracker 维护状态
+    # 彻底移除前端冗余的追踪器投票表，统一使用后端 HungarianTracker 维护状态
         self.loop_times = 0
 
         # 灰色装甲板映射（与 detector_node 一致）
@@ -191,35 +193,30 @@ class CameraDetector(Node):
             self.get_logger().warn(f"无法读取地图图片: {MAP_IMAGE_PATH}，将使用纯色底图")
             self.map_img = np.zeros((1500, 2800, 3), dtype=np.uint8)
 
-        # ---------- 启动线程 ----------
+        # 新增匈牙利 tracker，用于检测-轨迹关联，max_miss 配置可通过 detector config 调整
+        track_params = self.det_cfg.get('track', {})
+        # 从 config 读取完整的三段式生命周期参数
+        self.hungarian = HungarianTracker(
+            iou_thr=float(track_params.get('iou_thr', 0.05)),
+            dist_thr=float(track_params.get('dist_thr', 120)),
+            max_miss=int(track_params.get('max_miss', 54)),    # 最大容忍 54 帧 (1.3s)
+            # 提升浅层丢失阈值至 3，允许 YOLO 连续漏检 3 帧而不改变 TRACKING 状态，消除高频震荡
+            lost_thr=int(track_params.get('lost_thr', 3)),     
+            # 扩大盲猜介入阈值，拉开 LOST 与 GUESSING 的层级差距
+            guess_thr=int(track_params.get('guess_thr', 18))
+        )
+        # 当无检测时是否发布短期预测/历史位置信息（YAML 可配置）
+        # 统一从 track 层级读取配置，对齐配置文件结构
+        self.publish_predict_when_no_det = bool(track_params.get('publish_predict_when_no_det', True))
+        
+        self.get_logger().info("CameraDetector 初始化完成。")
+
+        # ---------- 启动线程 (置于初始化最末尾，确保所有组件就绪，避免竞态) ----------
         self.frame_thread = threading.Thread(target=self._sync_frame, daemon=True)
         self.frame_thread.start()
 
         self.infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         self.infer_thread.start()
-
-        # tunning: 新增匈牙利 tracker，用于检测-轨迹关联，max_miss 配置可通过 detector config 调整
-        track_params = self.det_cfg.get('track', {})
-        # // tunning: 从 config 读取完整的三段式生命周期参数
-        self.hungarian = HungarianTracker(
-            iou_thr=float(track_params.get('iou_thr', 0.05)),
-            dist_thr=float(track_params.get('dist_thr', 120)),
-            max_miss=int(track_params.get('max_miss', 54)),    # // tunning: 最大容忍 54 帧 (1.3s)
-            # // tunning: 提升浅层丢失阈值至 3，允许 YOLO 连续漏检 3 帧而不改变 TRACKING 状态，消除高频震荡
-            lost_thr=int(track_params.get('lost_thr', 3)),     
-            # // tunning: 扩大盲猜介入阈值，拉开 LOST 与 GUESSING 的层级差距
-            guess_thr=int(track_params.get('guess_thr', 18))
-        )
-        # tunning: 当无检测时是否发布短期预测/历史位置信息（YAML 可配置）
-        self.publish_predict_when_no_det = bool(self.det_cfg.get('publish_predict_when_no_det', True))
-        
-       # // tunning: 从参数文件读取盲猜配置，保持逻辑与参数绝对统一
-        self.guesser = PointGuesser(
-            decay_factor=float(track_params.get('decay_factor', 0.94)),
-            max_guess_sec=float(track_params.get('max_guess_sec', 1.3)),
-            max_speed=float(track_params.get('max_speed', 6.0))
-        )
-        self.get_logger().info("CameraDetector 初始化完成。")
 
     # ================================================================
     #  透视变换标定
@@ -474,7 +471,7 @@ class CameraDetector(Node):
         重置跟踪器和滤波器状态。
         在视频循环播放时调用，避免状态残留导致坐标错误。
         """
-        # // tunning: 重置后端唯一 tracker 维护者 HungarianTracker 的状态
+        # 重置后端唯一 tracker 维护者 HungarianTracker 的状态
         if hasattr(self, 'hungarian'):
             self.hungarian.tracks.clear()
             self.hungarian.next_id = 1
@@ -486,11 +483,11 @@ class CameraDetector(Node):
     #  YOLO 推理（复用已有 detector_node 的三阶段逻辑）
     # ================================================================
     
-    # tunning：将YOLO降级为纯检测，不再维护tracker，track_id 由后端匈牙利关联模块分配
     def _is_results_empty(self, results):
+        """将 YOLO 降级为纯检测模式，不再依赖前端 tracker_id 判空。"""
         if results is None:
             return True
-        # // tunning: 废除 ByteTrack id 检查，只要检测到框就算不为空
+        # 废除 ByteTrack id 检查，只要检测到框就算不为空
         if len(results[0].boxes) == 0:
             return True
         return False
@@ -498,12 +495,12 @@ class CameraDetector(Node):
     def _parse_results(self, results):
         confidences = results[0].boxes.conf.cpu().numpy()
         boxes = results[0].boxes.xywh.cpu().numpy()
-        # // tunning: 废弃 YOLO 的 track_id，前端只负责输出观测，ID 交由后端匈牙利分配
+        # 废弃 YOLO 的 track_id，前端只负责输出观测，ID 交由后端匈牙利分配
         track_ids = [None] * len(boxes)
         return confidences, boxes, track_ids
 
-    # // tunning: 将 _track_infer 改为 _predict_infer，不再调用 persist=True 和 tracker 黑盒
     def _predict_infer(self, frame):
+        """纯检测推理接口：不调用 persist=True 和 tracker 黑盒。"""
         results = self.model_car.predict(frame, verbose=False)
         return results
 
@@ -565,10 +562,10 @@ class CameraDetector(Node):
 
     def _infer(self, frame):
       
-        """tunning: 纯检测推理阶段：仅负责检测 + 裁剪装甲板二三阶段分类。"""
+        """纯检测推理阶段：仅负责检测与装甲板二/三阶段分类。"""
         if frame is None:
             return None, None
-        results = self._predict_infer(frame) # // tunning: 调用纯检测接口
+        results = self._predict_infer(frame) # 调用纯检测接口
         if self._is_results_empty(results):
             return frame, None
 
@@ -580,11 +577,11 @@ class CameraDetector(Node):
         box_list = []
 
         # for box, track_id, conf in zip(boxes, track_ids, confidences)
-        # // tunning: 废除多余的 zip 解包，纯检测阶段只关心原始观测框的位置
+        # 废除多余的 zip 解包，纯检测阶段只关心原始观测框的位置
         for box in boxes:
         # for box, track_id, conf in zip(boxes, track_ids, confidences):
 
-            # // tunning: 注释掉对 Track_value 投票表的时间衰减逻辑
+            # 注释掉对 Track_value 投票表的时间衰减逻辑
             # if self.loop_times % self.life_time == 1:
             #     for i in range(self.class_num):
             #         self.Track_value[int(track_id)][i] = math.floor(
@@ -620,7 +617,7 @@ class CameraDetector(Node):
             # status = 0
 
 
-            # // tunning: 新增纯净的瞬时观测输出逻辑，直接将当前帧分类结果转为字符串 label
+            # 新增纯净的瞬时观测输出逻辑，直接将当前帧分类结果转为字符串 label
             if classify_label != -1 and classify_label < len(self.labels):
                 label = str(self.labels[int(classify_label)])
             else:
@@ -633,10 +630,10 @@ class CameraDetector(Node):
             xywh_box = [x, y, w, h]
             xyxy_box = [x_left, y_left, x_right, y_right]
 
-            # // tunning: 强制清空前端 ID，ID判定彻底移交后端匈牙利 tracker
+            # 强制清空前端 ID，ID 判定彻底移交后端匈牙利 tracker
             track_id = None
 
-            # // tunning: 将分类器输出的真实置信度 conf 压入结果列表，取消硬编码 1.0
+            # 将分类器输出的真实置信度 conf 压入结果列表，取消硬编码 1.0
             draw_candidate.append([track_id, x_left, y_left, x_right, y_right, label])
             zip_results.append([xyxy_box, xywh_box, track_id, label, conf])
             
@@ -650,7 +647,7 @@ class CameraDetector(Node):
             cv2.putText(frame, f"raw:{lbl}", (x1 , y2 + 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 122), 2)
             
-            # // tunning: 注释掉在画面上绘制前端 track_id，交给匈牙利匹配后主循环绘制
+            # 注释掉在画面上绘制前端 track_id，交给匈牙利匹配后主循环绘制
             # cv2.putText(frame, str(tid), (x2 + 5, y2 + 5),
             #             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 122), 2)
 
@@ -672,7 +669,7 @@ class CameraDetector(Node):
         cv2.namedWindow("MiniMap", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("MiniMap", 800, 471)
 
-        # tunning:实时计算当前的帧数，而不是写死的 30fps，因为实际视频检测的帧数在15-25左右
+    # 实时计算当前帧率，而不是写死 30fps（推理实际帧率约 10-15fps）
         # start_time = time.time()
         start_time = time.perf_counter()
 
@@ -682,7 +679,7 @@ class CameraDetector(Node):
         while rclpy.ok():
             now = time.perf_counter()
 
-            # // tunning: 计算真实物理时间步长 dt，硬性限幅 [0.01, 0.1] (对应 100fps 到 10fps)
+            # 计算真实物理时间步长 dt，并限幅到 [0.01, 0.1]（对应 100fps 到 10fps）
             dt = max(0.01, min(0.1, now - start_time))
             fps = 1.0 / max(dt, 1e-6)
             start_time = now
@@ -707,10 +704,10 @@ class CameraDetector(Node):
                 carList_results = []
                 detections = []
 
+                # ==========================================
+                # 1. 数据标准化与去重
+                # ==========================================
                 if results is not None:
-                    # ==========================================
-                    # tunning: 1. 数据标准化：将 YOLO 结果打包为基建协议格式
-                    # ==========================================
                     raw_boxes = []
                     raw_scores = []
                     raw_data = []
@@ -722,7 +719,6 @@ class CameraDetector(Node):
                         raw_scores.append(conf)
                         raw_data.append(res)
 
-                    # --- ★ 修复点 1：把这里的 if 挪到 for 循环外面！ ---
                     if len(raw_boxes) > 0:
                         # 执行前端去重
                         keep_indices = nms_xywh(
@@ -746,129 +742,134 @@ class CameraDetector(Node):
                                 track_id=track_id
                             ))
 
-                    # ==========================================
-                    # tunning: 2. 匈牙利核心推演 (卡尔曼平滑 + ID关联)
-                    # ==========================================
-                    # tunning: 无论当前帧有无 YOLO 检测，都必须调用 update 推动卡尔曼滤波器向前推演
-                    # // tunning: 传递真实物理时间步长 dt，确保卡尔曼预测位移准确
-                    active_robots = self.hungarian.update(detections, dt)
+                # ==========================================
+                # 2. 匈牙利核心推演（卡尔曼平滑 + ID 关联）
+                # ==========================================
+                # 无论当前帧有无 YOLO 检测，都必须调用 update 推动卡尔曼滤波器向前推演
+                # 这是实现遮挡时轨迹惯性滑行的核心：无检测时 detections 为空列表
+                active_robots = self.hungarian.update(detections, dt)
 
-                    # ==========================================
-                    # tunning: 3. 坐标投影与下发：仅使用平滑后的卡尔曼预测框
-                    # ==========================================
-                    # // tunning: 新增防分身集合，记录本帧已经露头的真实车辆
-                    published_car_ids = set()
-                    for robot in active_robots:
-                        # tunning: 身份投票决议：取出历史投票中最多的 label 作为最终身份
-                        best_label = max(robot.vote_pool, key=robot.vote_pool.get) if robot.vote_pool else "NULL"
-                        
-                        # tunning: 过滤己方车辆 (复用原有逻辑)
-                        car_id = self.carList.get_car_id(best_label) if best_label != "NULL" else -1
-                        if car_id == -1 and best_label == "NULL":
-                            car_id = 9000 + robot.id  # tunning: 测试模式临时ID
-                        elif car_id == -1:
-                            continue
-                        # // tunning: ★ 判定敌我身份，但不再 continue
-                        # 敌人的定义：颜色不同 且 不是 -1 (1-7 是红，101-107 是蓝)
-                        is_enemy = (self.my_color == "Red" and car_id >= 100) or \
-                                   (self.my_color == "Blue" and car_id < 100 and car_id != -1)
-                        robot.is_enemy = is_enemy # 标记身份，给后面的 guesser 用
-
-                        is_my_7 = (self.my_color == "Red" and car_id == 7) or \
-                                  (self.my_color == "Blue" and car_id == 107)
-
-                        # =================【修改 1：先把框画出来】=================
-                        kf_cx, kf_cy, kf_w, kf_h = robot.bbox_kf_state[:4]
-                        k_x1, k_y1 = int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0)
-                        k_x2, k_y2 = int(kf_cx + kf_w / 2.0), int(kf_cy + kf_h / 2.0)
-
-                        if kf_w > 2.0 and kf_h > 2.0:
-                            should_draw = False
-                            box_color = (0, 0, 0)
-
-                            if (is_enemy or is_my_7) and robot.state != TrackingState.GUESSING:
-                                should_draw = True
-                                if robot.state == TrackingState.TRACKING:
-                                    box_color = (0, 255, 255) if is_enemy else (255, 0, 0)
-                                elif robot.state == TrackingState.LOST:
-                                    box_color = (255, 0, 255)
-                                # tunning: 注释掉 GUESSING 画框逻辑（不再绘制灰色盲猜框）
-                            elif robot.state == TrackingState.TRACKING:
-                                should_draw = True
-                                box_color = (255, 50, 0)
-
-                            if should_draw:
-                                cv2.rectangle(result_img, (k_x1, k_y1), (k_x2, k_y2), box_color, 2)
-                                display_label = best_label if best_label != "NULL" else f"NULL-{robot.id}"
-                                cv2.putText(result_img, display_label, (k_x1, k_y1 - 5),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-                                disp_fx = robot.field_x if robot.field_x is not None else 0.0
-                                disp_fy = robot.field_y if robot.field_y is not None else 0.0
-                                state_info = f"({disp_fx:.1f},{disp_fy:.1f}) {robot.state.name}"
-                                cv2.putText(result_img, state_info, (k_x1, k_y1 - 25),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-                        # ==========================================================
-
-                        # =================【修改 2：拦截 GUESSING 重投影】=================
-                        if robot.state == TrackingState.GUESSING:
-                            continue
-                        # ================================================================
-
-                        # ==========================================
-                        # 核心坐标计算逻辑 (保持原封不动，确保 field_x 不为 None)
-                        # ==========================================
-                        orig_cx = kf_cx * ORIG_W / INFER_W
-                        orig_cy = kf_cy * ORIG_H / INFER_H
-                        orig_h = kf_h * ORIG_H / INFER_H
-                        orig_w = kf_w * ORIG_W / INFER_W
-                        
-                        px = orig_cx
-                        py = orig_cy + (orig_h / 2.0)
-
-                        field_coord = self.pixel_to_field(px, py)
-                        if field_coord is None:
-                            continue
-                        field_x, field_y = field_coord
-
-                        field_x = max(0.0, min(28.0, field_x))
-                        field_y = max(0.0, min(15.0, field_y))
-
-                        field_xyz = np.array([field_x, field_y, 0.0])
-
-                        if robot.state == TrackingState.TRACKING and robot.field_x is not None:
-                            dx, dy = field_x - robot.field_x, field_y - robot.field_y
-                            jump_dist = (dx**2 + dy**2)**0.5
-                            if jump_dist < 0.3:
-                                raw_vx, raw_vy = dx / dt, dy / dt
-                                robot.field_vx = 0.5 * getattr(robot, 'field_vx', 0.0) + 0.5 * raw_vx
-                                robot.field_vy = 0.5 * getattr(robot, 'field_vy', 0.0) + 0.5 * raw_vy
-                        
-                        robot.field_x, robot.field_y = field_x, field_y
-                        # // tunning: ★ 发布门控 - 只有敌人或己方7号/107号才发布坐标
-                            
-                        if is_enemy or is_my_7:
-
-                            if best_label != "NULL":
-                                carList_results.append([robot.id, car_id, [float(orig_cx), float(orig_cy), float(orig_w), float(orig_h)], 1, [0.0,0.0,0.0], field_xyz])
-
-                            published_car_ids.add(car_id)
-                            loc = Location()
-
-                            loc.x, loc.y, loc.z = float(field_x), float(field_y), 0.0
-                            loc.id, loc.label = int(car_id), ("Red" if car_id < 100 else "Blue")
-                            allLocation.locs.append(loc)
-
-
-
-                    # ==========================================
-                    # 4. 更新 CarList 与 发布 (原有逻辑)
-                    # ==========================================
-                    if carList_results:
-                        self.carList.update_car_info(carList_results)
+                # ==========================================
+                # 3. 坐标投影与下发：仅使用平滑后的卡尔曼预测框
+                # ==========================================
+                published_car_ids = set()
+                for robot in active_robots:
+                    # 身份投票决议：取出历史投票中最高票标签作为最终身份
+                    best_label = max(robot.vote_pool, key=robot.vote_pool.get) if robot.vote_pool else "NULL"
                     
-                    # 此时 allLocation 已经包含了“观测点”和“盲猜点”
-                    self.pub_location.publish(allLocation)
+                    # 过滤己方车辆（复用原有逻辑）
+                    car_id = self.carList.get_car_id(best_label) if best_label != "NULL" else -1
+                    if car_id == -1 and best_label == "NULL":
+                        car_id = 9000 + robot.id  # 测试模式临时 ID
+                    elif car_id == -1:
+                        continue
+
+                    # 敌人的定义：颜色不同 且 不是 -1 (1-7 是红，101-107 是蓝)
+                    is_enemy = (self.my_color == "Red" and car_id >= 100) or \
+                               (self.my_color == "Blue" and car_id < 100 and car_id != -1)
+                    robot.is_enemy = is_enemy
+
+                    is_my_7 = (self.my_color == "Red" and car_id == 7) or \
+                              (self.my_color == "Blue" and car_id == 107)
+
+                    # =================【渲染层：先把框画出来】=================
+                    kf_cx, kf_cy, kf_w, kf_h = robot.bbox_kf_state[:4]
+                    k_x1, k_y1 = int(kf_cx - kf_w / 2.0), int(kf_cy - kf_h / 2.0)
+                    k_x2, k_y2 = int(kf_cx + kf_w / 2.0), int(kf_cy + kf_h / 2.0)
+
+                    if kf_w > 2.0 and kf_h > 2.0:
+                        should_draw = False
+                        box_color = (0, 0, 0)
+
+                        if (is_enemy or is_my_7) and robot.state != TrackingState.GUESSING:
+                            should_draw = True
+                            if robot.state == TrackingState.TRACKING:
+                                box_color = (0, 255, 255) if is_enemy else (255, 0, 0)
+                            elif robot.state == TrackingState.LOST:
+                                box_color = (255, 0, 255)
+                        elif robot.state == TrackingState.TRACKING:
+                            should_draw = True
+                            box_color = (255, 50, 0)
+
+                        if should_draw:
+                            cv2.rectangle(result_img, (k_x1, k_y1), (k_x2, k_y2), box_color, 2)
+                            display_label = best_label if best_label != "NULL" else f"NULL-{robot.id}"
+                            cv2.putText(result_img, display_label, (k_x1, k_y1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                            disp_fx = robot.field_x if robot.field_x is not None else 0.0
+                            disp_fy = robot.field_y if robot.field_y is not None else 0.0
+                            state_info = f"({disp_fx:.1f},{disp_fy:.1f}) {robot.state.name}"
+                            cv2.putText(result_img, state_info, (k_x1, k_y1 - 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+                    # 分级发布逻辑控制
+                    # 1. TRACKING / LOST 状态强制发布以确保连贯性 (LOST 约 0.1s~0.6s)
+                    # 2. GUESSING 状态由 publish_predict_when_no_det 开关控制 (0.6s~1.8s)
+                    should_publish_this_loc = False
+                    if robot.state in [TrackingState.TRACKING, TrackingState.LOST]:
+                        should_publish_this_loc = True
+                    elif robot.state == TrackingState.GUESSING and self.publish_predict_when_no_det:
+                        should_publish_this_loc = True
+                    
+                    if not should_publish_this_loc:
+                        continue
+
+                    # ==========================================
+                    # 核心坐标计算逻辑
+                    # ==========================================
+                    orig_cx = kf_cx * ORIG_W / INFER_W
+                    orig_cy = kf_cy * ORIG_H / INFER_H
+                    orig_h = kf_h * ORIG_H / INFER_H
+                    orig_w = kf_w * ORIG_W / INFER_W
+                    
+                    px = orig_cx
+                    py = orig_cy + (orig_h / 2.0)
+
+                    field_coord = self.pixel_to_field(px, py)
+                    if field_coord is None:
+                        continue
+                    field_x, field_y = field_coord
+
+                    field_x = max(0.0, min(28.0, field_x))
+                    field_y = max(0.0, min(15.0, field_y))
+
+                    field_xyz = np.array([field_x, field_y, 0.0])
+
+                    if robot.state == TrackingState.TRACKING and robot.field_x is not None:
+                        dx, dy = field_x - robot.field_x, field_y - robot.field_y
+                        jump_dist = (dx**2 + dy**2)**0.5
+                        if jump_dist < 0.3:
+                            raw_vx, raw_vy = dx / dt, dy / dt
+                            robot.field_vx = 0.5 * getattr(robot, 'field_vx', 0.0) + 0.5 * raw_vx
+                            robot.field_vy = 0.5 * getattr(robot, 'field_vy', 0.0) + 0.5 * raw_vy
+                    
+                    robot.field_x, robot.field_y = field_x, field_y
+                    # 发布门控：只有敌人或己方 7 号/107 号才发布坐标
+                        
+                    if is_enemy or is_my_7:
+                        # 对于非实测点 (LOST/GUESSING)，在 z 轴打上暗号标识
+                        is_predict = (robot.state in [TrackingState.LOST, TrackingState.GUESSING])
+                        loc_z = -1.0 if is_predict else 0.0
+
+                        if best_label != "NULL":
+                            # carList 更新包围框和物理坐标 (用于底层 Car 逻辑同步)
+                            carList_results.append([robot.id, car_id, [float(orig_cx), float(orig_cy), float(orig_w), float(orig_h)], 1, [0.0,0.0,loc_z], field_xyz])
+
+                        published_car_ids.add(car_id)
+                        loc = Location()
+
+                        loc.x, loc.y, loc.z = float(field_x), float(field_y), float(loc_z)
+                        loc.id, loc.label = int(car_id), ("Red" if car_id < 100 else "Blue")
+                        allLocation.locs.append(loc)
+
+                # ==========================================
+                # 4. 更新 CarList 与 发布 (原有逻辑)
+                # ==========================================
+                if carList_results:
+                    self.carList.update_car_info(carList_results)
+                
+                self.pub_location.publish(allLocation)
 
 
                 # ---------- 在推理图像上显示 FPS ----------
@@ -902,28 +903,18 @@ class CameraDetector(Node):
             x = round(loc.x, 2)
             y = round(loc.y, 2)
 
-            # // tunning: 提取 z 坐标，接收盲猜暗号
-            z = round(loc.z, 2)
-
-            # 赛场坐标 → 地图像素（地图与世界坐标系方向一致，无需镜像）
+            # 赛场坐标 → 地图像素
             map_xx = max(0, min(int(x * 100), 2800))
             map_yy = max(0, min(int(1500 - y * 100), 1500))
             disp_x = x
             disp_y = y
 
-            # // tunning: 判断是否为视觉推演的“幽灵点”
-            is_guessing = (z < 0.0)
-
-            # // tunning: 机器人颜色不仅决定阵营，还决定是否为盲猜状态
-            # [debug] 发布盲猜点的坐标
-            # if is_guessing:
-            #     color = (200, 200, 200)  # 盲猜幽灵点统一为亮灰色 (BGR)
+            # 机器人颜色由阵营决定
             if loc.label == 'Red':
-                # 红方：盲猜点画紫色 (BGR: 255, 0, 255)，正常画红色
-                color = (255, 0, 255) if is_guessing else (0, 0, 255)
+                color = (0, 0, 255)
             else:
-                # 蓝方：盲猜点画青蓝色 (BGR: 255, 255, 0)，正常画蓝色
-                color = (255, 255, 0) if is_guessing else (250, 100, 0) # tunning: 蓝色改为更亮的橙蓝色，增强视觉区分度
+                # 蓝方：使用更亮的橙蓝色，增强视觉区分度
+                color = (250, 100, 0)
 
             # 绘制圆圈和编号
             cv2.circle(show_map, (map_xx, map_yy), 60, color, 4)

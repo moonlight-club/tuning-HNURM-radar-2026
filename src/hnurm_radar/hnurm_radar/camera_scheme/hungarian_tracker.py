@@ -1,14 +1,16 @@
 """
 hungarian_tracker.py — 纯视觉 2D 目标关联器
 ==========================================================
-利用 BBoxKalmanFilter 提供的高质量预测边界框，结合 YOLO 观测结果，
-通过匈牙利算法实现帧间目标的 ID 关联与生命周期维护。
+本模块在图像像素坐标系内完成目标关联与状态维护。
+它结合边界框卡尔曼bbox_kalman预测结果与当前帧检测结果，通过匈牙利最优分配算法实现
+稳定的跨帧 ID 关联，并输出可供上层发布逻辑直接消费的轨迹状态集合。
 
-核心改动点：
-  - 彻底解耦物理坐标变换，专职维护像素域的 RobotState。
-  - 匹配逻辑由 "历史观测 vs 当前观测" 升级为 "卡尔曼先验预测 vs 当前观测"进行tracker匹配。
-  - 引入 vote_pool 身份投票机制雏形。
-  - 接入 shared.utils 工具箱，剔除内部冗余的 IoU 和坐标系转换代码。
+核心逻辑与主要功能：
+    - 以 `BBoxKalmanFilter` 先验预测框作为关联基准，执行“预测框 vs 检测框”的代价匹配。
+    - 使用 IoU、中心距离与身份一致性共同构建代价矩阵，并通过空间门控抑制误匹配。
+    - 维护 `RobotState` 生命周期状态机（TRACKING / LOST / GUESSING / RE_ACQUIRED）。
+    - 维护 `vote_pool` 身份投票池，通过时间衰减与惯性增益提升短时遮挡下的身份稳定性。
+    - 对长期漏检或低可信轨迹执行回收，并进行全局同标签冲突仲裁，保证 ID 语义一致性。
 """
 import time
 import numpy as np
@@ -25,14 +27,13 @@ class HungarianTracker:
     基于 BBoxKalmanFilter 的匈牙利关联器。
     严格只处理图像平面的 2D 追踪与关联。
     """
-# // tunning: 增加 lost_thr 和 guess_thr 参数，分别控制浅层丢失和深度丢失的状态转换阈值
-# // tunning: 新增 label_penalty(身份冲突惩罚) 和 vote_decay(选票时间衰减率)
     # [debug]适当调高vote_delay，降低遗忘速率
     def __init__(self, iou_thr=0.05, dist_thr=120, max_miss=45, lost_thr=3, guess_thr=10, 
                  label_penalty=1000.0, vote_decay=0.97):
+        """初始化关联器阈值与投票参数。"""
         
-        self.label_penalty = float(label_penalty) # // tunning: 发生分类冲突时的巨大代价惩罚
-        self.vote_decay = float(vote_decay)       # // tunning: 每帧历史选票的衰减系数，用于遗忘旧状态
+        self.label_penalty = float(label_penalty) # 发生分类冲突时的巨大代价惩罚
+        self.vote_decay = float(vote_decay)       # 每帧历史选票的衰减系数，用于遗忘旧状态
         self.tracks = []  # 存活轨迹列表 list[RobotState]
         self.kf = BBoxKalmanFilter()  # 无状态卡尔曼推演工具
         self.next_id = 1
@@ -40,8 +41,8 @@ class HungarianTracker:
         self.dist_thr = float(dist_thr)
         
         self.max_miss = int(max_miss)   # 引入卡尔曼后，容忍丢失的帧数可以适当调大
-        self.lost_thr = int(lost_thr)   # // tunning: 浅层丢失阈值
-        self.guess_thr = int(guess_thr) # // tunning: 深度丢失盲猜阈值
+        self.lost_thr = int(lost_thr)   # 浅层丢失阈值
+        self.guess_thr = int(guess_thr) # 深度丢失盲猜阈值
          
 
     def _cost_matrix(self, tracks, dets):
@@ -76,15 +77,15 @@ class HungarianTracker:
                 # 调用 utils 工具箱计算 IoU
                 iou = compute_iou(tr_xyxy, d.xyxy)
 
-                # // tunning: 引入归一化中心距离 ，目标点很远的时候采用欧式距离，其余使用iou距离
+                # 引入归一化中心距离：远目标强调欧式距离，其余场景由 IoU + 距离联合判定
                 # 消除目标尺度对距离代价的影响，提升远距离小目标的匹配鲁棒性
                 dist = np.hypot(dcx - tcx, dcy - tcy)       # 绝对像素距离
                 diag = np.hypot(tw, th)                     # 预测框对角线长度
                 norm_dist = dist / (diag + 1e-5)            # 归一化距离 (加极小值防除零)
                 
                 # 空间门控过滤：距离差异过大且 IoU 低于设定阈值时，拒绝匹配
-                # [debug]norm_dist增大，检查交错身份劫持是否有所缓解
-                if iou < self.iou_thr and norm_dist > 1.2:
+                # 使用配置参数 self.dist_thr（像素）作为硬门控，norm_dist 作为辅助
+                if iou < self.iou_thr and dist > self.dist_thr:
                     continue
                     
                 # 1. 计算基础几何得分
@@ -101,7 +102,7 @@ class HungarianTracker:
                         continue
                 elif best_label == "NULL" or d.label == "NULL":
                     # 存在未知标签 (NULL) 时，提供基础正向得分，协助状态机平滑过渡
-                    id_score = 0.2
+                    id_score = 0.5
 
                 # 3. 计算最终匹配代价 (取累加得分的相反数)
                 total_score = geom_score + (id_score * W_id)
@@ -139,18 +140,18 @@ class HungarianTracker:
         # ==========================================
         for tr in self.tracks:
 
-            # tunning: ★ 引入身份投票池时间衰减机制
+            # 引入身份投票池时间衰减机制
             # 每经过一帧，将所有历史选票乘以 vote_decay，实现平滑遗忘,使得错误观测的影响逐渐减弱，允许轨迹在短暂丢失后恢复正确身份。
-            # tunning: 仅当目标处于视野内 (miss_cnt == 0) 时执行身份衰减。
+            # 仅当目标处于视野内 (miss_cnt == 0) 时执行身份衰减。
             # 目标被遮挡期间必须冻结历史身份，防止盲猜推演因失去 ID 而中断。
             if tr.miss_cnt == 0:
                 for label_key in list(tr.vote_pool.keys()):
                     tr.vote_pool[label_key] *= self.vote_decay
-                    # // tunning: 清理低于阈值的“死票”，防止字典无限膨胀
+                    # 清理低于阈值的“死票”，防止字典无限膨胀
                     if tr.vote_pool[label_key] < 0.1:
                         del tr.vote_pool[label_key]
 
-            # # // tunning: 只要丢失视野，立刻冻结像素层速度，防止预测框飘到别的机器人身上导致 ID 错误
+            # 只要丢失视野，立刻冻结像素层速度，防止预测框飘到别的机器人身上导致 ID 错误
             # if tr.miss_cnt > 0:
             #     tr.bbox_kf_state[4:] = 0.0
             tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.predict(tr.bbox_kf_state, tr.bbox_kf_cov, dt)
@@ -187,7 +188,7 @@ class HungarianTracker:
             z = np.array(det.xywh)
             tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z)
             
-            # tunning: 身份惯性投票逻辑 (EMA优化版)
+            # 身份惯性投票逻辑（EMA 优化版）
             # 核心目的：在单帧漏检数字时，利用物理框的连续性维持之前的兵种身份，且防止 NULL 稀释权重
             if det.label != "NULL":
                 # 情况 A：当前帧清晰地识别到了数字，正常进行权重累加
@@ -230,7 +231,7 @@ class HungarianTracker:
             tr = self.tracks[ti]
             tr.miss_cnt += 1
             
-            # // tunning: ★ 核心修复 - 真正的三段式状态机
+            # 核心修复：真正的三段式状态机
             if tr.miss_cnt > self.guess_thr:
                 # 漏检超过 guess_thr，进入长时遮挡，交由 guess_pts 进行赛场物理推演
                 tr.state = TrackingState.GUESSING
@@ -263,7 +264,7 @@ class HungarianTracker:
             
             # 实例化新的 RobotState 容器
             new_tr = RobotState(id=new_id)
-            # // tunning: 初始投票权重必须使用检测结果的真实置信度，防止 NULL 获得满额权重
+            # 初始投票权重必须使用检测结果的真实置信度，防止 NULL 获得满额权重
             new_tr.vote_pool[det.label] = det.conf
             new_tr.last_seen_time = time.time()
             
@@ -281,10 +282,10 @@ class HungarianTracker:
         # ==========================================
         surviving_tracks = []
         for tr in self.tracks:
-            # // tunning: 统计该 ID 在整个生命周期内被 YOLO 真正“看清楚”的总次数
+            # 统计该 ID 在整个生命周期内被 YOLO 真正“看清楚”的总次数
             total_hits = sum(tr.vote_pool.values())
             
-            # // tunning: 核心策略 —— 区分对待：
+            # 核心策略：区分对待
             # 1. 如果是确认过的“真车”（命中>=5次），允许它在掩体后滑行 max_miss 帧 (1.5s)。
             # 2. 如果只是闪现的“噪音”（命中<5次），丢视野 3 帧立刻销毁，防止堆积导致卡顿！
             allowed_max_miss = self.max_miss if total_hits >= 5 else 3
