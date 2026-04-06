@@ -14,8 +14,6 @@ hungarian_tracker.py — 纯视觉 2D 目标关联器
 """
 import time
 import numpy as np
-import os # [debug] 引入日志所需库
-from collections import deque # [debug] 引入残差历史队列
 from scipy.optimize import linear_sum_assignment
 
 # 导入底层数据基建与滤波引擎
@@ -161,12 +159,6 @@ class HungarianTracker:
         # ==========================================
         # 2. 匹配步 (Associate)
         # ==========================================
-        # [debug] 增加残差统计开关与日志路径
-        self.debug_residual_log = True
-        self.residual_log_path = "logs/kalman_residuals.csv"
-        if self.debug_residual_log and not os.path.exists("logs"):
-            os.makedirs("logs")
-
         cost = self._cost_matrix(self.tracks, detections)
         matches = []
         unmatched_t = list(range(len(self.tracks)))
@@ -194,21 +186,7 @@ class HungarianTracker:
             
             # 提取观测值 Z = [cx, cy, w, h] 并送入卡尔曼观测更新
             z = np.array(det.xywh)
-            # tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z) # [debug] 原始代码
-            tr.bbox_kf_state, tr.bbox_kf_cov, innovation = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z) # [debug] 新增残差记录
-
-            # [debug] 残差历史缓冲区逻辑
-            if not hasattr(tr, "residual_history"):
-                tr.residual_history = deque(maxlen=100)
-            tr.residual_history.append(innovation)
-
-            # [debug] 日志输出逻辑 - 增加 label 字段并修复 nan 问题
-            if self.debug_residual_log:
-                best_label = "NULL"
-                if tr.vote_pool:
-                    best_label = max(tr.vote_pool, key=tr.vote_pool.get)
-                with open(self.residual_log_path, "a") as f:
-                    f.write(f"{time.time()},{tr.id},{best_label},{innovation[0]},{innovation[1]},{innovation[2]},{innovation[3]}\n")
+            tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z)
             
             # 身份惯性投票逻辑（EMA 优化版）
             # 核心目的：在单帧漏检数字时，利用物理框的连续性维持之前的兵种身份，且防止 NULL 稀释权重
@@ -260,22 +238,10 @@ class HungarianTracker:
                 # 漏检超过 guess_thr，进入长时遮挡，交由 guess_pts 进行赛场物理推演
                 tr.state = TrackingState.GUESSING
             elif tr.miss_cnt > self.lost_thr:
-                # [debug]闪现起飞拦截与调试信息！
-                # 只有在状态【刚刚】转为 LOST 的那一帧打印，防止刷屏
                 if tr.state != TrackingState.LOST:
                     vx, vy = tr.bbox_kf_state[4], tr.bbox_kf_state[5]
                     vw, vh = tr.bbox_kf_state[6], tr.bbox_kf_state[7]
-                    
-                    # 打印出起飞前的罪证！
-                    print(f"\n[DEBUG 预警] 机器人 ID:{tr.id} 丢失视野！")
-                    print(f"  -> 消失前坐标: cx={tr.bbox_kf_state[0]:.1f}, cy={tr.bbox_kf_state[1]:.1f}")
-                    print(f"  -> 继承的瞬时速度: vx={vx:.1f}, vy={vy:.1f} | 缩放速度: vw={vw:.1f}, vh={vh:.1f}")
-                    
-                    # 可选：如果你发现真的是速度太离谱导致闪现，可以在这里强行刹车
-                    # if abs(vx) > 20 or abs(vy) > 20:
-                    #     print("  -> 速度异常偏大，已触发强制刹车！")
-                    #     tr.bbox_kf_state[4:] = 0.0
-                # 漏检超过 lost_thr 但未超过 guess_thr，依靠 bbox_kalman 在像素层滑行防闪烁
+                
                 tr.state = TrackingState.LOST
 
         # ==========================================
