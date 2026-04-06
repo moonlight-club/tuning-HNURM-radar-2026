@@ -1,0 +1,28 @@
+# BoT-SORT tracker 配置 (适配 HNURM 雷达站 camera_scheme)
+# 基于港科大 HKUST ENTERPRIZE RM2025 开源方案调整
+# 参考文档: https://docs.ultralytics.com/modes/track/
+
+tracker_type: botsort          # tracker 类型
+
+# 帧间关联阈值 (实际推理帧率 10-18fps)
+track_high_thresh: 0.25        # 第一轮关联的置信度下限
+track_low_thresh: 0.1          # 第二轮关联的置信度下限 (捕获低置信度目标)
+new_track_thresh: 0.25         # 新建轨迹的最低置信度
+
+# 轨迹生命周期管理
+# track_buffer: 丢失后保留的帧数, 10fps 下 30 帧约 3 秒
+# 此参数决定 BoT-SORT 何时释放旧 ID 并分配新 ID
+# 注: 最终目标身份由后端匈牙利 tracker 的 vote_pool 决议,
+#      BoT-SORT 的 ID 重分配不会导致最终身份丢失
+track_buffer: 30
+
+match_thresh: 0.8              # IoU 匹配阈值
+fuse_score: True               # 是否将置信度融合到 IoU 距离中
+
+# BoT-SORT 特有参数
+gmc_method: None               # 全局运动补偿 (雷达站相机固定, 无需补偿)
+
+# 外观特征关联 (利用 YOLO 检测器自身中间特征, 不额外加载模型)
+proximity_thresh: 0.5          # 外观匹配的最小 IoU 前置过滤
+appearance_thresh: 0.5         # 外观相似度阈值
+with_reid: False               # 不启用 ReID 外观特征
