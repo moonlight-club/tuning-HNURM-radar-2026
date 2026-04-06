@@ -85,3 +85,7 @@ scripts/evaluate_quatro_error.py
 scripts/check_relocalation_tf.py
 scripts/lidar_cam_projection_debug.py
 scripts/live_icp_debugger.py
+logs/residuals_id_9001.png
+CLAUDE.md
+logs/kalman_residuals.csv
+.claudeignore

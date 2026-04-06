@@ -23,7 +23,8 @@ params:
 # 匈牙利匹配 tracker 参数 (主追踪链路控制)
 track:
   iou_thr: 0.05                # IoU 门控下限
-  dist_thr: 120                # 中心距离门控 (像素空间距离)
+  # [debug] 收紧门控，防止画面边缘噪声误匹配导致残差巨震
+  dist_thr: 80                 # 中心距离门控 (像素空间距离) 原来：120
   lost_thr: 3                  # 漏检 1~3 帧: 维持 TRACKING 状态，防闪烁
   guess_thr: 18                # 漏检 4~18 帧: 进入 LOST 状态，强制惯性发布
   max_miss: 54                 # 漏检 >54 帧 (约 1.8s): 目标彻底移除

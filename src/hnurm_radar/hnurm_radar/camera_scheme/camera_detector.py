@@ -25,7 +25,7 @@ from ruamel.yaml import YAML
 from ..Car.Car import CarList
 from ..camera_locator.anchor import Anchor
 from ..camera_locator.point_picker import PointsPicker
-from ..filters.kalman_filter import KalmanFilterWrapper
+# from ..filters.kalman_filter import KalmanFilterWrapper # 废弃 KalmanFilter物理卡尔曼
 from .hungarian_tracker import HungarianTracker  # 新增匈牙利关联模块导入
 from ..shared.type import SingleDetectionResult, TrackingState # 引入底层数据协议与状态机
 from ..shared.utils import nms_xywh, compute_iou, xywh2xyxy
@@ -679,8 +679,8 @@ class CameraDetector(Node):
         while rclpy.ok():
             now = time.perf_counter()
 
-            # 计算真实物理时间步长 dt，并限幅到 [0.01, 0.1]（对应 100fps 到 10fps）
-            dt = max(0.01, min(0.1, now - start_time))
+            # 计算真实物理时间步长 dt，并限幅到 [0.01, 0.2]（对应 100fps 到 5fps）
+            dt = max(0.01, min(0.2, now - start_time))
             fps = 1.0 / max(dt, 1e-6)
             start_time = now
 
@@ -915,7 +915,7 @@ class CameraDetector(Node):
             else:
                 # 蓝方：使用更亮的橙蓝色，增强视觉区分度
                 color = (250, 100, 0)
-
+            
             # 绘制圆圈和编号
             cv2.circle(show_map, (map_xx, map_yy), 60, color, 4)
             cv2.putText(show_map, str(loc.id), (map_xx - 15, map_yy + 10),

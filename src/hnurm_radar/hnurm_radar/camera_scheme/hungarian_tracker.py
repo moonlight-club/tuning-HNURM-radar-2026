@@ -14,6 +14,8 @@ hungarian_tracker.py — 纯视觉 2D 目标关联器
 """
 import time
 import numpy as np
+import os # [debug] 引入日志所需库
+from collections import deque # [debug] 引入残差历史队列
 from scipy.optimize import linear_sum_assignment
 
 # 导入底层数据基建与滤波引擎
@@ -159,6 +161,12 @@ class HungarianTracker:
         # ==========================================
         # 2. 匹配步 (Associate)
         # ==========================================
+        # [debug] 增加残差统计开关与日志路径
+        self.debug_residual_log = True
+        self.residual_log_path = "logs/kalman_residuals.csv"
+        if self.debug_residual_log and not os.path.exists("logs"):
+            os.makedirs("logs")
+
         cost = self._cost_matrix(self.tracks, detections)
         matches = []
         unmatched_t = list(range(len(self.tracks)))
@@ -186,7 +194,21 @@ class HungarianTracker:
             
             # 提取观测值 Z = [cx, cy, w, h] 并送入卡尔曼观测更新
             z = np.array(det.xywh)
-            tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z)
+            # tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z) # [debug] 原始代码
+            tr.bbox_kf_state, tr.bbox_kf_cov, innovation = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z) # [debug] 新增残差记录
+
+            # [debug] 残差历史缓冲区逻辑
+            if not hasattr(tr, "residual_history"):
+                tr.residual_history = deque(maxlen=100)
+            tr.residual_history.append(innovation)
+
+            # [debug] 日志输出逻辑 - 增加 label 字段并修复 nan 问题
+            if self.debug_residual_log:
+                best_label = "NULL"
+                if tr.vote_pool:
+                    best_label = max(tr.vote_pool, key=tr.vote_pool.get)
+                with open(self.residual_log_path, "a") as f:
+                    f.write(f"{time.time()},{tr.id},{best_label},{innovation[0]},{innovation[1]},{innovation[2]},{innovation[3]}\n")
             
             # 身份惯性投票逻辑（EMA 优化版）
             # 核心目的：在单帧漏检数字时，利用物理框的连续性维持之前的兵种身份，且防止 NULL 稀释权重
@@ -230,6 +252,8 @@ class HungarianTracker:
         for ti in unmatched_t:
             tr = self.tracks[ti]
             tr.miss_cnt += 1
+
+      
             
             # 核心修复：真正的三段式状态机
             if tr.miss_cnt > self.guess_thr:
@@ -278,7 +302,7 @@ class HungarianTracker:
             self.tracks.append(new_tr)
 
         # ==========================================
-        # 6. 垃圾回收 - 区分“真身”与“噪音”防卡顿
+        # 6. 垃圾回收 - 区分“真身”与“噪音”
         # ==========================================
         surviving_tracks = []
         for tr in self.tracks:
@@ -288,6 +312,7 @@ class HungarianTracker:
             # 核心策略：区分对待
             # 1. 如果是确认过的“真车”（命中>=5次），允许它在掩体后滑行 max_miss 帧 (1.5s)。
             # 2. 如果只是闪现的“噪音”（命中<5次），丢视野 3 帧立刻销毁，防止堆积导致卡顿！
+            # [debug] 终止生存策略修改，还原原始逻辑
             allowed_max_miss = self.max_miss if total_hits >= 5 else 3
             
             if tr.miss_cnt <= allowed_max_miss:

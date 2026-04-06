@@ -24,7 +24,7 @@ import numpy as np
 class BBoxKalmanFilter(object):
     """
     标准的 8 状态边界框卡尔曼滤波器工具类。
-    遵循标准 EKF 的变量命名规范，但保持无状态设计。
+    与EKF变量命名统一。
     """
     def __init__(self, dt: float = 1.0/30.0):
         """
@@ -40,17 +40,22 @@ class BBoxKalmanFilter(object):
         for i in range(self.m):
             self.F_k[i, self.m + i] = 1.0
 
-            # // tunning: ★ 引入预测阻尼（摩擦力），防止预测框因异常速度“飞出去”
-            # 对角线元素默认是 1 (v = v)。这里改为 0.99，意味着每推演一帧，像素速度会自动衰减 1%。这在保持预测方向的同时，强行截断了速度爆炸。
-            # [debug] 增加阻尼，防止LOST预测框飞出去
-            self.F_k[self.m + i, self.m + i] = 0.99
+        # 预测阻尼：平移速度弱阻尼、尺度速度强阻尼，用于抑制异常外推。
+        self.vel_damping_xy = 0.95   # vx, vy
+        self.vel_damping_wh = 0.90    # vw, vh
 
+        self.F_k[4, 4] = self.vel_damping_xy
+        self.F_k[5, 5] = self.vel_damping_xy
+        self.F_k[6, 6] = self.vel_damping_wh
+        self.F_k[7, 7] = self.vel_damping_wh  
+                
+                
         # [debug]切断 vw (宽度变化率) 和 vh (高度变化率) 在预测步中对实际宽高的影响。
         # 这样在纯预测 (LOST/GUESSING) 期间，中心点(cx, cy)会按速度(vx, vy)正常滑行，
         # 但框的大小(w, h)将被死死锁住，保持消失前最后一帧的真实大小，面积绝不会变为0！
         # ==========================================
-        self.F_k[2, 6] = 0.0  # 锁死宽度的缩放预测
-        self.F_k[3, 7] = 0.0  # 锁死高度的缩放预测
+        # self.F_k[2, 6] = 0.0  # 锁死宽度的缩放预测
+        # self.F_k[3, 7] = 0.0  # 锁死高度的缩放预测
 
         # 传感器测量值向量与预测值向量之间的线性转换矩阵 (观测矩阵)
         # m x n矩阵, H_k(mxn) * X(nx1) = ZZ_k(mx1)
@@ -59,21 +64,32 @@ class BBoxKalmanFilter(object):
         # 单位矩阵I, 这里当数字1使用. P_k = (I - K_k*H_k)*P_k
         self.I = np.eye(self.n)
 
-        # [debug3]降低对匀速运动模型的过度信任，保证平滑过后的检测框能够跟上机器人实际的快速转向和加速
-        self._q_weight_pos = 1.0 / 500     
-        self._q_weight_vel = 1.0 / 100      
+        # # [debug3]降低对匀速运动模型的过度信任，保证平滑过后的检测框能够跟上机器人实际的快速转向和加速
+        # # [debug] 进一步调大 Q_vel (30->10)，提高速度修正的瞬时响应
+        # self._q_weight_pos = 1.0 / 150     
+        # self._q_weight_vel = 1.0 / 10      
+        # self._q_weight_scale = 1.0 / 20000
+
+
+        # # 2. 观测噪声基准权重 (R): 保持对观测值的适度信任，构建低通屏障
+        # # [debug] 调大 R_pos 权重 (
+        # # 分母 150->500)，极大提升对 YOLO 观测的信任，消除平滑滞后
+        # self._r_weight_pos = 1.0 / 150      # 中心点位置的观测噪声权重 (量级远大于Q)
+        # self._r_weight_scale = 1.0 / 200    # 尺度的观测噪声权重
+
+        # [degub3]除了画面消失的机器人，其他的残差波动都比较小
+        self._q_weight_pos = 1.0 / 10000    
+        self._q_weight_vel = 1.0 / 80      
         self._q_weight_scale = 1.0 / 20000
 
 
         # 2. 观测噪声基准权重 (R): 保持对观测值的适度信任，构建低通屏障
-        self._r_weight_pos = 1.0 / 150      # 中心点位置的观测噪声权重 (量级远大于Q)
+        self._r_weight_pos = 1.0 / 100      # 中心点位置的观测噪声权重 (量级远大于Q)
         self._r_weight_scale = 1.0 / 200    # 尺度的观测噪声权重
         
         
-        # # [debug2]放宽位置的过程噪声权重，尝试解决拐弯速度跟不上的问题
-        # # ==========================================
-        # # // tunning: 配合阻尼，释放敏捷跟踪能力！
-        # # ==========================================
+        # # [debug2]坐标滤波过后比较平滑，但是出现平滑检测框跟不上实际机器人的情况了
+        # 而且预测的效果不佳，预测框基本没有速度，停留在原地
         # self._q_weight_pos = 1.0 / 4000      # 提高对位置突变的信任，解决拐弯跟不上
         # self._q_weight_vel = 1.0 / 400      # 放宽速度变化，有 0.85 的阻尼护航，绝对不会飞出！
         # self._q_weight_scale = 1.0 / 20000
@@ -99,8 +115,7 @@ class BBoxKalmanFilter(object):
 
     def _get_adaptive_sf(self, w, h):
         """
-        // tunning: 计算尺度自适应因子 (Scale Factor)。
-        用于处理远距离小目标检测框抖动剧烈的问题。
+        计算尺度自适应因子，用于降低远距离小目标框抖动的影响。
         """
         area = w * h
         # 设定基准面积为 3600 px^2 (60x60)
@@ -120,7 +135,7 @@ class BBoxKalmanFilter(object):
         # x: 上一时刻(k-1)或当前时刻k的状态向量: n个元素向量
         x = np.r_[z, np.zeros_like(z)]
 
-        # // tunning: 引入尺度因子 sf，针对远距离小目标适度放大初始不确定性
+        # 引入尺度因子 sf，针对远距离小目标适度放大初始不确定性。
         sf = self._get_adaptive_sf(z[2], z[3])
 
         # 初始协方差矩阵设定：给速度项分配极大的不确定性
@@ -149,11 +164,11 @@ class BBoxKalmanFilter(object):
             x_pred: 新时刻(k)的先验预测状态向量
             P_current: 新时刻的先验预测协方差矩阵
         """
-        # // tunning: 动态更新状态转移矩阵中的 dt 系数，确保位移量与真实时间步长对齐
+        # 动态更新状态转移矩阵中的 dt 系数，使位移与真实时间步长一致。
         self.F_k[0, 4] = dt
         self.F_k[1, 5] = dt
 
-        # // tunning: 依据当前预测框的宽高计算尺度因子
+        # 根据当前预测框宽高计算尺度因子。
         sf = self._get_adaptive_sf(x[2], x[3])
 
         # Q_k: 各状态变量的预测噪声协方差矩阵 (动态计算)
@@ -172,11 +187,11 @@ class BBoxKalmanFilter(object):
         Q_k = np.diag(np.square(np.r_[std_pos, std_vel]))
 
         # 预测状态方程
-        # (1). X_k = F_k * X_k-1
+        # X_k = F_k * X_k-1
         x_pred = np.dot(self.F_k, x)
 
         # 预测协方差矩阵
-        # (2). P_k = F_k * P_k-1 * F_k^T + Q_k
+        # P_k = F_k * P_k-1 * F_k^T + Q_k
         P_current = np.dot(self.F_k, np.dot(P_result, self.F_k.T)) + Q_k
 
         return x_pred, P_current
@@ -188,9 +203,13 @@ class BBoxKalmanFilter(object):
             x: 预测状态向量 (X_k)
             P_current: 预测协方差矩阵 (P_k)
             z: 当前时刻 YOLO 传感器读数 [cx, cy, w, h]
+        返回:
+            x_new: 更新后的状态向量
+            P_result: 更新后的协方差矩阵
+            innovation: [debug] 残差 (z - Hx) 用于量化分析
         """
 
-        # // tunning: 依据当前观测值计算尺度因子
+        # 依据当前观测值计算尺度因子
         sf = self._get_adaptive_sf(z[2], z[3])
 
         # R_k: 传感器测量噪声协方差矩阵 (动态计算)
@@ -203,36 +222,49 @@ class BBoxKalmanFilter(object):
         R_k = np.diag(np.square(std))
 
         # 预估测量值向量
-        # zz_k = H_k * X_k
         zz_k = np.dot(self.H_k, x)
+
 
         # S_k: 创新协方差矩阵 (系统残差的协方差)
         # S_k = H_k * P_k * H_k^T + R_k
         S_k = np.dot(self.H_k, np.dot(P_current, self.H_k.T)) + R_k
 
         # 卡尔曼增益: K_k
-        # (3). K_k = P_k * H_k^T * (H_k * P_k * H_k^T + R_k)^-1
         K_k = np.dot(np.dot(P_current, self.H_k.T), np.linalg.inv(S_k))
 
-        # 最终,最优预测状态向量值
-        # (4). X^_k = X_k + K_k * (z_k - zz_k) 
+        # 最优预测状态向量值
+        # X^_k = X_k + K_k * (z_k - zz_k) 
         x_new = x + np.dot(K_k, (z - zz_k))
 
-        # // tunning: ★ 暴力重置逻辑（Jump Reset）
+        P_result = np.dot(self.I - np.dot(K_k, self.H_k), P_current)
+
+
         # 如果 YOLO 观测点和卡尔曼预测点中心距离超过 150 像素，直接判定预测失败
         # 强行重置位置并清空瞬时速度，防止预测框“起飞”
         dist = np.linalg.norm(x[:2] - z[:2])
         if dist > 150:
             x_new[:4] = z
             x_new[4:] = 0.0
-            # [DEBUG] 发生突变时，直接返回重置后的状态和协方差矩阵，实现“冷启动”
+            
+            # 底层状态硬钳制。限制像素速度 (vx, vy, vw, vh) 单帧最大变化量不超过 50 像素
+            x_new[4:] = np.clip(x_new[4:], -50, 50)
+
+
+            # 大残差回退：仅重置位置与尺度，保留平移速度连续性
+            x_new[:4] = z
+
+            # 保留并衰减平移速度，避免“速度归零”导致后续几乎不动
+            x_new[4:6] = 0.7 * x[4:6]
+
+            # 尺度速度在突变时清零，防止宽高发散
+            x_new[6:8] = 0.0
+
+            # 协方差回退但不完全冷启动，降低抖动
+            P_reset = P_current.copy()
+            P_reset[:4, :4] *= 0.5   # 位置尺度更信观测
+            P_reset[4:, 4:] *= 1.2   # 速度保持一定不确定性
+        
             return x_new, np.eye(self.n)
 
-        # // tunning: 底层状态硬钳制。限制像素速度 (vx, vy, vw, vh) 单帧最大变化量不超过 50 像素
-        x_new[4:] = np.clip(x_new[4:], -50, 50)
-
-        # 最后,最优预测协方差矩阵
-        # (5). P^_k = P_k - K_k * H_k * P_k = (I - K_k * H_k) * P_k
-        P_result = np.dot(self.I - np.dot(K_k, self.H_k), P_current)
-
+            
         return x_new, P_result
