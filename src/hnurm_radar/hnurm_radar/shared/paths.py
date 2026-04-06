@@ -42,6 +42,7 @@ DETECTOR_CONFIG_PATH = os.path.join(CONFIGS_DIR, "detector_config.yaml")
 CONVERTER_CONFIG_PATH = os.path.join(CONFIGS_DIR, "converter_config.yaml")
 PERSPECTIVE_CALIB_PATH = os.path.join(CONFIGS_DIR, "perspective_calib.json")
 BYTETRACK_CONFIG_PATH = os.path.join(CONFIGS_DIR, "bytetrack.yaml")
+BOTSORT_CONFIG_PATH = os.path.join(CONFIGS_DIR, "botsort.yaml")
 HAP_CONFIG_PATH = os.path.join(CONFIGS_DIR, "HAP_config.json")
 ICP_RVIZ_PATH = os.path.join(CONFIGS_DIR, "icp.rviz")
 

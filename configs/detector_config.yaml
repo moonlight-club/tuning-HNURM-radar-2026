@@ -3,7 +3,7 @@ path:
   stage_one_path:  "weights/stage_one.pt"
   stage_two_path: "weights/stage_two.pt"
   stage_three_path: "weights/stage_three.pt"
-  tracker_path: "configs/bytetrack.yaml"
+  tracker_path: "configs/botsort.yaml"
 
 params:
   labels: ["B1", "B2", "B3", "B4", "B5", "B7", "R1", "R2", "R3", "R4", "R5", "R7"]

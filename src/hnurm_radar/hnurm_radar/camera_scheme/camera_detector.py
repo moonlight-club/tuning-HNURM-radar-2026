@@ -476,8 +476,14 @@ class CameraDetector(Node):
             self.hungarian.tracks.clear()
             self.hungarian.next_id = 1
 
+        # 重置 BoT-SORT 内部状态, 防止旧 ID 泄露到新循环
+        if hasattr(self.model_car, 'predictor') and self.model_car.predictor is not None:
+            if hasattr(self.model_car.predictor, 'trackers'):
+                for tracker in self.model_car.predictor.trackers:
+                    tracker.reset()
+
         if self.is_debug:
-            self.get_logger().info("跟踪器和滤波器状态已重置")
+            self.get_logger().info("跟踪器和滤波器状态已重置（含 BoT-SORT）")
 
     # ================================================================
     #  YOLO 推理（复用已有 detector_node 的三阶段逻辑）
@@ -495,13 +501,22 @@ class CameraDetector(Node):
     def _parse_results(self, results):
         confidences = results[0].boxes.conf.cpu().numpy()
         boxes = results[0].boxes.xywh.cpu().numpy()
-        # 废弃 YOLO 的 track_id，前端只负责输出观测，ID 交由后端匈牙利分配
-        track_ids = [None] * len(boxes)
+        # 从 BoT-SORT 提取底层帧间关联 ID (首帧或未分配时 box.id 为 None)
+        if results[0].boxes.id is not None:
+            track_ids = results[0].boxes.id.int().cpu().numpy().tolist()
+        else:
+            track_ids = [None] * len(boxes)
         return confidences, boxes, track_ids
 
     def _predict_infer(self, frame):
-        """纯检测推理接口：不调用 persist=True 和 tracker 黑盒。"""
-        results = self.model_car.predict(frame, verbose=False)
+        """检测+追踪推理接口：调用 BoT-SORT 获取帧间关联 track_id。"""
+        results = self.model_car.track(
+            frame,
+            persist=True,
+            tracker=self.tracker_path,
+            conf=self.stage_one_conf,
+            verbose=False,
+        )
         return results
 
     def _classify_infer(self, roi_list):
@@ -573,13 +588,11 @@ class CameraDetector(Node):
         confidences, boxes, track_ids = self._parse_results(results)
         zip_results = []
         roi_list = []
-        # id_list = []
+        tid_list = []   # BoT-SORT 帧间关联 ID 列表
         box_list = []
 
-        # for box, track_id, conf in zip(boxes, track_ids, confidences)
-        # 废除多余的 zip 解包，纯检测阶段只关心原始观测框的位置
-        for box in boxes:
-        # for box, track_id, conf in zip(boxes, track_ids, confidences):
+        # 将 BoT-SORT 的 track_id 随 ROI 一起向下传递
+        for box, tid in zip(boxes, track_ids):
 
             # 注释掉对 Track_value 投票表的时间衰减逻辑
             # if self.loop_times % self.life_time == 1:
@@ -594,7 +607,7 @@ class CameraDetector(Node):
             if roi.size == 0:
                 continue
             roi_list.append(roi)
-            # id_list.append(track_id)
+            tid_list.append(tid)
             box_list.append(box)
 
         if len(roi_list) == 0:
@@ -611,7 +624,7 @@ class CameraDetector(Node):
         for i in range(len(roi_list)):
             classify_label = label_list[i]
             conf = conf_list[i]
-            # track_id = id_list[i]
+            track_id = tid_list[i]  # BoT-SORT 分配的底层帧间关联 ID
             box = box_list[i]
             x, y, w, h = box
             # status = 0
@@ -630,8 +643,7 @@ class CameraDetector(Node):
             xywh_box = [x, y, w, h]
             xyxy_box = [x_left, y_left, x_right, y_right]
 
-            # 强制清空前端 ID，ID 判定彻底移交后端匈牙利 tracker
-            track_id = None
+            # track_id 来自 BoT-SORT 的帧间关联, 作为匈牙利匹配的辅助特征传递给后端
 
             # 将分类器输出的真实置信度 conf 压入结果列表，取消硬编码 1.0
             draw_candidate.append([track_id, x_left, y_left, x_right, y_right, label])
@@ -643,13 +655,12 @@ class CameraDetector(Node):
         # 在图像上画出检测结果
         for box in draw_candidate:
             tid, x1, y1, x2, y2, lbl = box
-            # cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 128, 0), 3)
             cv2.putText(frame, f"raw:{lbl}", (x1 , y2 + 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 122), 2)
-            
-            # 注释掉在画面上绘制前端 track_id，交给匈牙利匹配后主循环绘制
-            # cv2.putText(frame, str(tid), (x2 + 5, y2 + 5),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 122), 2)
+            # 绘制 BoT-SORT 分配的底层帧间关联 ID (调试用)
+            if tid is not None:
+                cv2.putText(frame, f"bot:{tid}", (x1, y2 + 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 255), 2)
 
         self.loop_times += 1
         return frame, zip_results

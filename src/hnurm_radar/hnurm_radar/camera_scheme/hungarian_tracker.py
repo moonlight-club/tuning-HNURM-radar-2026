@@ -62,6 +62,7 @@ class HungarianTracker:
         W_iou = 1.0   # 边界框交并比 (IoU) 权重
         # [debug]提高欧氏距离权重，强化空间门控的区分能力
         W_dist = 2.5  # 归一化中心距离权重
+        W_bot = 1.0   # BoT-SORT bot_id 帧间关联一致性权重
 
         for i, tr in enumerate(tracks):
             # 提取卡尔曼滤波器【预测】的先验状态 [cx, cy, w, h]
@@ -104,8 +105,16 @@ class HungarianTracker:
                     # 存在未知标签 (NULL) 时，提供基础正向得分，协助状态机平滑过渡
                     id_score = 0.5
 
-                # 3. 计算最终匹配代价 (取累加得分的相反数)
-                total_score = geom_score + (id_score * W_id)
+                # 3. 计算 BoT-SORT bot_id 帧间关联一致性得分
+                # bot_id 相同表示 BoT-SORT 判定为同一物理目标, 作为辅助匹配信号
+                bot_score = 0.0
+                det_bot_id = getattr(d, 'track_id', None)
+                if tr.bot_id >= 0 and det_bot_id is not None:
+                    if tr.bot_id == det_bot_id:
+                        bot_score = 1.0  # bot_id 一致, 加分
+
+                # 4. 计算最终匹配代价 (取累加得分的相反数)
+                total_score = geom_score + (id_score * W_id) + (bot_score * W_bot)
                 cost[i, j] = -total_score
                 
                 
@@ -183,10 +192,14 @@ class HungarianTracker:
         for ti, di in matches:
             tr = self.tracks[ti]
             det = detections[di]
-            
+
             # 提取观测值 Z = [cx, cy, w, h] 并送入卡尔曼观测更新
             z = np.array(det.xywh)
             tr.bbox_kf_state, tr.bbox_kf_cov = self.kf.update(tr.bbox_kf_state, tr.bbox_kf_cov, z)
+
+            # 同步 BoT-SORT 的底层帧间关联 ID
+            if det.track_id is not None:
+                tr.bot_id = det.track_id
             
             # 身份惯性投票逻辑（EMA 优化版）
             # 核心目的：在单帧漏检数字时，利用物理框的连续性维持之前的兵种身份，且防止 NULL 稀释权重
@@ -219,8 +232,8 @@ class HungarianTracker:
             else:
                 tr.state = TrackingState.TRACKING
             
-            # --- ★ 修复点 2：新增独立物理命中计数器，每被 YOLO 看到一次就加 1，不受 0.05 的压榨 ---
-            tr.hit_cnt = getattr(tr, 'hit_cnt', 0) + 1  
+            # 物理命中计数器递增
+            tr.hit_cnt += 1
             tr.miss_cnt = 0
             tr.last_seen_time = time.time()
 
@@ -251,20 +264,24 @@ class HungarianTracker:
             det = detections[dj]
             new_id = det.track_id if det.track_id is not None else (9000 + self.next_id)
             self.next_id += 1
-            
+
             # 实例化新的 RobotState 容器
             new_tr = RobotState(id=new_id)
             # 初始投票权重必须使用检测结果的真实置信度，防止 NULL 获得满额权重
             new_tr.vote_pool[det.label] = det.conf
             new_tr.last_seen_time = time.time()
-            
+
             # --- ★ 修复点 3：初始化物理命中次数 ---
             new_tr.hit_cnt = 1
+
+            # 继承 BoT-SORT 的底层帧间关联 ID
+            if det.track_id is not None:
+                new_tr.bot_id = det.track_id
 
             # 初始化卡尔曼状态与协方差矩阵
             z = np.array(det.xywh)
             new_tr.bbox_kf_state, new_tr.bbox_kf_cov = self.kf.initiate(z)
-            
+
             self.tracks.append(new_tr)
 
         # ==========================================

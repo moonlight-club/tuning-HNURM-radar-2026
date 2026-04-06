@@ -83,8 +83,18 @@ class RobotState:
     
     # 连续漏检帧数计数值
     # 【写权限】：仅限 camera_scheme/camera_detector.py
-    miss_cnt: int = 0    
-    
+    miss_cnt: int = 0
+
+    # BoT-SORT 底层帧间关联 ID (物理连续性标识, 非最终兵种身份)
+    # 【写权限】：仅限 camera_scheme/hungarian_tracker.py
+    # 【用途】：作为匈牙利匹配代价矩阵的辅助维度, 提升遮挡后重关联准确率
+    bot_id: int = -1
+
+    # 累计物理命中计数 (被 YOLO 检测到的总帧数)
+    # 【写权限】：仅限 camera_scheme/hungarian_tracker.py
+    # 【用途】：区分"真车"与"噪音", 决定垃圾回收时的容忍帧数
+    hit_cnt: int = 0
+
     last_seen_time: float = 0.0 # 上次真实观测的绝对时间戳
     
     # 兵种身份投票池: {label_name: count}
